@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +76,20 @@ const (
 	defaultQueueSize = 128
 	// defaultWorkers 未配置 worker 数量时的兜底值。
 	defaultWorkers = 4
+	// defaultTaskTimeout 租户配额与全局配置都未指定超时时的兜底执行时长。
+	defaultTaskTimeout = 15 * time.Minute
+	// defaultQueueJournalName 队列日志默认文件名（与数据快照同目录）。
+	defaultQueueJournalName = "queue.journal"
+	// sharedClaimLimit 启动时从共享存储认领排队任务的最大条数（避免一次拉爆队列容量）。
+	sharedClaimLimit = 64
+	// runHeartbeatInterval 执行期心跳周期：刷新运行更新时间，防止被僵尸回收误判。
+	runHeartbeatInterval = 30 * time.Second
+	// reapGrace 僵尸回收宽限：在任务超时之上额外留出的判定余量，避免误杀临界任务。
+	reapGrace = 2 * time.Minute
+	// reapInterval 僵尸运行扫描周期。
+	reapInterval = 5 * time.Minute
+	// maxWorkers worker 数硬上限，防止配额配置异常导致 goroutine 爆炸。
+	maxWorkers = 512
 )
 
 // Engine Agent 调度核心实现（domain.TaskEngine）。
@@ -83,7 +98,7 @@ const (
 // 状态机迁移、取消、重跑与统计查询。所有 map/计数字段的访问均加锁。
 type Engine struct {
 	cfg  *config.Config
-	st   *store.Store
+	st   store.Store
 	pipe domain.TaskPipeline
 	rec  domain.Recorder
 	bus  domain.EventBus
@@ -94,8 +109,10 @@ type Engine struct {
 	// publicURL 对外可访问的基础地址，用于回调/响应生成报告跳转链接。
 	publicURL string
 
-	mu      sync.Mutex
-	queue   chan string
+	mu    sync.Mutex
+	queue *priorityQueue
+	// journal 队列日志：入队/出队追加写盘，进程重启后据此恢复排队中的任务。
+	journal *queueJournal
 	running map[string]*runHandle
 	// pending 已受理但尚未出队就被取消的 run 集合（worker 出队时据此直接判取消）。
 	pending map[string]struct{}
@@ -129,7 +146,7 @@ type submitAuthorizer interface {
 }
 
 // NewEngine 创建调度核心。
-func NewEngine(cfg *config.Config, st *store.Store, pipe domain.TaskPipeline, rec domain.Recorder,
+func NewEngine(cfg *config.Config, st store.Store, pipe domain.TaskPipeline, rec domain.Recorder,
 	bus domain.EventBus, auth domain.Authorizer, log *logx.Logger) (*Engine, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("配置不能为空")
@@ -147,6 +164,20 @@ func NewEngine(cfg *config.Config, st *store.Store, pipe domain.TaskPipeline, re
 	if q <= 0 {
 		q = defaultQueueSize
 	}
+	// 队列日志默认与数据快照同目录：只要开启了文件持久化，排队任务就不会因重启丢失。
+	// 显式配置 "-" 表示关闭队列持久化（退回纯内存队列）。
+	journalPath := strings.TrimSpace(cfg.Engine.QueueJournalFile)
+	if journalPath == "-" {
+		journalPath = ""
+	} else if journalPath == "" && strings.TrimSpace(cfg.Store.DataFile) != "" {
+		journalPath = filepath.Join(filepath.Dir(cfg.Store.DataFile), defaultQueueJournalName)
+	}
+	journal, err := openQueueJournal(journalPath)
+	if err != nil {
+		return nil, fmt.Errorf("打开队列日志失败：%w", err)
+	}
+	queue := newPriorityQueue(q)
+	queue.SetJournal(journal)
 	return &Engine{
 		cfg:        cfg,
 		st:         st,
@@ -156,11 +187,93 @@ func NewEngine(cfg *config.Config, st *store.Store, pipe domain.TaskPipeline, re
 		auth:       auth,
 		log:        log,
 		httpClient: &http.Client{Timeout: callbackTimeout},
-		queue:      make(chan string, q),
+		queue:      queue,
+		journal:    journal,
 		running:    map[string]*runHandle{},
 		pending:    map[string]struct{}{},
 		baseCtx:    context.Background(),
 	}, nil
+}
+
+// recoverQueued 回放队列日志，把"重启时仍在排队"的任务重新入队。
+//
+// 判定以存储为权威：已终态或已不存在的 run 直接丢弃；排队中的 run 按原
+// 优先级与入队时刻恢复，保证重启前后调度顺序一致（含老化计时）。
+func (e *Engine) recoverQueued() int {
+	restored := make([]restoredItem, 0)
+	seen := map[string]bool{}
+
+	if e.journal != nil {
+		pending, err := e.journal.Replay()
+		if err != nil {
+			e.log.Error("回放队列日志失败，跳过排队任务恢复", "err", err)
+		} else {
+			for _, it := range pending {
+				run, ok := e.st.GetRunRaw(it.RunID)
+				if !ok {
+					continue // 运行记录已不存在（数据被清理）
+				}
+				if run.State.IsTerminal() {
+					continue // 重启前已进入终态，不应复活
+				}
+				if run.State != domain.StateQueued {
+					// 非 queued 且非终态（如 analyzing）：说明重启前已出队但日志未写完，
+					// 交由僵尸回收统一收敛，不在此重复入队。
+					continue
+				}
+				priority := it.Priority
+				if run.Priority > 0 {
+					priority = run.Priority // 存储中的优先级为最新权威值
+				}
+				if err := e.queue.PushRestored(it.RunID, priority, it.EnqueuedAt); err != nil {
+					e.log.Warn("恢复排队任务失败", "run", it.RunID, "err", err)
+					continue
+				}
+				restored = append(restored, it)
+				seen[it.RunID] = true
+			}
+			// 压缩：已出队/已终态的记录不再需要，避免日志无限增长。
+			if err := e.journal.Compact(restored); err != nil {
+				e.log.Warn("压缩队列日志失败", "err", err)
+			}
+		}
+	}
+
+	// 共享存储模式下还要认领"其他实例遗留"的排队任务（多实例部署的核心）。
+	shared := e.claimSharedQueued(seen)
+	total := len(restored) + shared
+	if total > 0 {
+		e.log.Info("已恢复排队中的任务", "journal", len(restored), "shared", shared)
+		e.audit(domain.AuditEvent{Category: "task", Action: "engine.recover", Level: "warn",
+			Message: fmt.Sprintf("启动后恢复排队任务 %d 条（日志回放 %d，共享存储认领 %d）", total, len(restored), shared)})
+	}
+	return total
+}
+
+// claimSharedQueued 从共享存储认领排队任务。
+//
+// 多实例部署时，实例重启后其他实例受理的 queued 任务仍留在共享存储里；
+// 这里通过原子认领（UPDATE ... WHERE state='queued'）把它们接管过来，
+// 保证同一任务不会被两个实例同时执行。内存/文件存储不实现该接口，自动跳过。
+func (e *Engine) claimSharedQueued(skip map[string]bool) int {
+	claimer, ok := e.st.(store.QueueClaimer)
+	if !ok {
+		return 0
+	}
+	claimed := claimer.ClaimQueued(sharedClaimLimit)
+	n := 0
+	for i := range claimed {
+		run := claimed[i]
+		if skip[run.ID] {
+			continue
+		}
+		if err := e.queue.PushRestored(run.ID, run.Priority, run.CreatedAt); err != nil {
+			e.log.Warn("认领排队任务入队失败", "run", run.ID, "err", err)
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +283,113 @@ func NewEngine(cfg *config.Config, st *store.Store, pipe domain.TaskPipeline, re
 // SetPublicURL 设置对外可访问的基础地址（含协议与端口），用于回调报文与开放接口
 // 响应中拼装报告跳转链接；建议在 Start 之前装配。
 func (e *Engine) SetPublicURL(u string) { e.publicURL = strings.TrimRight(u, "/") }
+
+// ---------------------------------------------------------------------------
+// 调度参数与僵尸回收
+// ---------------------------------------------------------------------------
+
+// taskTimeoutFor 返回某租户的单任务执行超时：优先租户配额 MaxTaskSeconds，
+// 其次全局 engine.taskTimeoutSec，最后兜底 defaultTaskTimeout。
+//
+// 说明：原先只取全局超时，租户配额里的 MaxTaskSeconds 定义了却从未参与调度，
+// 租户无法按自身 SLA 约束单任务时长。
+func (e *Engine) taskTimeoutFor(tenantID string) time.Duration {
+	if tenant, ok := e.st.GetTenant(tenantID); ok && tenant.Quota.MaxTaskSeconds > 0 {
+		return time.Duration(tenant.Quota.MaxTaskSeconds) * time.Second
+	}
+	if e.cfg != nil && e.cfg.TaskTimeout() > 0 {
+		return e.cfg.TaskTimeout()
+	}
+	return defaultTaskTimeout
+}
+
+// maxTenantConcurrency 取所有租户并发上限的最大值，作为 worker 数的下界。
+//
+// 背景：worker 数（默认 4）小于租户并发上限（默认 8）时，会出现"允许排队 8 个、
+// 只有 4 个在执行"，排队任务既占用额度又迟迟不推进，队列白白堆积。
+func (e *Engine) maxTenantConcurrency() int {
+	max := 0
+	for _, t := range e.st.ListTenants() {
+		// 0 表示不限，无法据此推导下界，跳过。
+		if t.Quota.MaxConcurrentTasks <= 0 {
+			continue
+		}
+		if t.Quota.MaxConcurrentTasks > max {
+			max = t.Quota.MaxConcurrentTasks
+		}
+	}
+	if max <= 0 {
+		return domain.DefaultQuota().MaxConcurrentTasks
+	}
+	return max
+}
+
+// reapStaleRuns 回收僵尸运行，返回回收数量。
+//
+// 进程重启或异常退出会留下非终态记录；而 countActive 把 queued/analyzing/repairing/verifying
+// 全部计入租户并发占用，这些记录会让额度永久泄漏，表现为"跑一段时间后提交就报配额上限"。
+// 判定条件：非终态 + 不在本进程执行中 + 更新时间早于（任务超时 + 宽限）。
+func (e *Engine) reapStaleRuns() int {
+	reaped := 0
+	for _, t := range e.st.ListTenants() {
+		limit := e.taskTimeoutFor(t.ID)
+		deadline := time.Now().Add(-(limit + reapGrace))
+		for _, r := range e.st.AllRuns(t.ID) {
+			if r.State.IsTerminal() {
+				continue
+			}
+			e.mu.Lock()
+			_, running := e.running[r.ID]
+			e.mu.Unlock()
+			if running {
+				// 本进程正在执行：交给该 run 自身的 context 超时，不在此回收。
+				continue
+			}
+			ref := r.UpdatedAt
+			if ref.IsZero() {
+				ref = r.CreatedAt
+			}
+			if ref.IsZero() || ref.After(deadline) {
+				continue
+			}
+			cp := r
+			from := cp.State
+			cp.State = domain.StateFailed
+			cp.Error = fmt.Sprintf("任务超过 %s 未收敛，已由调度器回收（可能由进程重启导致的僵尸运行）", limit)
+			cp.EndedAt = time.Now()
+			cp.UpdatedAt = cp.EndedAt
+			if err := e.st.UpdateRun(&cp); err != nil {
+				continue
+			}
+			e.publishState(&cp, from, domain.StateFailed)
+			e.publish(domain.Event{
+				Type: "task.terminal", TenantID: cp.TenantID, RunID: cp.ID, TaskID: cp.TaskID,
+				Level: "error", Message: cp.Error, Payload: map[string]any{"state": string(cp.State)},
+			})
+			e.audit(domain.AuditEvent{TenantID: cp.TenantID, RunID: cp.ID, TaskID: cp.TaskID,
+				Category: "task", Action: "task.reaped", Level: "warn", Message: cp.Error})
+			reaped++
+		}
+	}
+	return reaped
+}
+
+// reaper 周期性回收僵尸运行，直到 Stop 关闭 stopCh 后退出。
+func (e *Engine) reaper() {
+	defer e.wg.Done()
+	ticker := time.NewTicker(reapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			if n := e.reapStaleRuns(); n > 0 {
+				e.log.Warn("周期回收僵尸运行", "count", n)
+			}
+		}
+	}
+}
 
 // Start 启动 worker pool。重复调用幂等（已启动则直接返回）。
 func (e *Engine) Start(ctx context.Context) error {
@@ -196,15 +416,40 @@ func (e *Engine) Start(ctx context.Context) error {
 	if workers <= 0 {
 		workers = defaultWorkers
 	}
+	// worker 数不得小于租户并发上限：否则排队任务空占额度却无人执行。
+	if floor := e.maxTenantConcurrency(); workers < floor {
+		workers = floor
+	}
+	// 上界：不超过队列容量（超出的 worker 无槽可取），也不超过硬上限。
+	if n := e.queue.Capacity(); n > 0 && workers > n {
+		workers = n
+	}
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
+	// 先恢复重启前排队中的任务，再启动 worker：否则恢复的任务要等下一轮调度窗口。
+	recovered := e.recoverQueued()
 	for i := 0; i < workers; i++ {
 		e.wg.Add(1)
 		go e.worker()
 	}
-	queueSize := cap(e.queue)
+	e.wg.Add(1)
+	go e.reaper()
+	queueSize := e.queue.Capacity()
 	e.mu.Unlock()
 
-	e.audit(domain.AuditEvent{Category: "task", Action: "engine.start", Level: "info",
-		Message: fmt.Sprintf("调度引擎已启动：workers=%d，queueSize=%d", workers, queueSize)})
+	// 僵尸回收：进程重启会留下非终态记录，若不清理将永久占用租户并发额度。
+	if n := e.reapStaleRuns(); n > 0 {
+		e.log.Warn("启动时回收僵尸运行", "count", n)
+		e.audit(domain.AuditEvent{Category: "task", Action: "engine.reap", Level: "warn",
+			Message: fmt.Sprintf("启动时回收僵尸运行 %d 条（进程重启遗留的非终态记录）", n)})
+	}
+
+	msg := fmt.Sprintf("调度引擎已启动：workers=%d，queueSize=%d", workers, queueSize)
+	if recovered > 0 {
+		msg += fmt.Sprintf("，恢复排队任务 %d 条", recovered)
+	}
+	e.audit(domain.AuditEvent{Category: "task", Action: "engine.start", Level: "info", Message: msg})
 	return nil
 }
 
@@ -218,6 +463,8 @@ func (e *Engine) Stop() error {
 	}
 	e.stopped = true
 	close(e.stopCh)
+	// 关闭队列：唤醒阻塞在出队上的 worker（worker 以 Pop 返回 false 作为退出信号）。
+	e.queue.Close()
 	e.mu.Unlock()
 
 	done := make(chan struct{})
@@ -235,6 +482,10 @@ func (e *Engine) Stop() error {
 	e.mu.Lock()
 	inflight := len(e.running)
 	e.mu.Unlock()
+	// 队列日志落盘关闭：未出队的记录保留在日志中，下次启动继续恢复。
+	if e.journal != nil {
+		_ = e.journal.Close()
+	}
 	e.audit(domain.AuditEvent{Category: "task", Action: "engine.stop", Level: "info",
 		Message: fmt.Sprintf("调度引擎已停止，停止时在途任务 %d 个", inflight)})
 	return nil
@@ -242,13 +493,8 @@ func (e *Engine) Stop() error {
 
 // drainQueue 把停止时仍排队的任务标记为失败（避免永久停留在 queued 的假状态）。
 func (e *Engine) drainQueue() {
-	for {
-		select {
-		case runID := <-e.queue:
-			e.failQueued(runID, "调度引擎已停止，任务未执行")
-		default:
-			return
-		}
+	for _, runID := range e.queue.Drain() {
+		e.failQueued(runID, "调度引擎已停止，任务未执行")
 	}
 }
 
@@ -273,12 +519,12 @@ func (e *Engine) failQueued(runID, reason string) {
 func (e *Engine) worker() {
 	defer e.wg.Done()
 	for {
-		select {
-		case <-e.stopCh:
+		// 出队按优先级（含老化）择优；队列关闭且排空后 Pop 返回 false，worker 退出。
+		runID, ok := e.queue.Pop()
+		if !ok {
 			return
-		case runID := <-e.queue:
-			e.execute(runID)
 		}
+		e.execute(runID)
 	}
 }
 
@@ -365,7 +611,8 @@ func (e *Engine) submit(ctx context.Context, tenantID string, req domain.CreateT
 
 	if quota.MaxConcurrentTasks > 0 {
 		if active := e.countActive(tenantID); active >= quota.MaxConcurrentTasks {
-			msg := fmt.Sprintf("当前运行中任务数（%d）已达租户并发上限（%d），请稍后重试", active, quota.MaxConcurrentTasks)
+			// 消息须含"配额"关键词：接入层据此映射 429（而非 500）并附 Retry-After。
+			msg := fmt.Sprintf("当前运行中任务数（%d）已达租户并发配额上限（%d），本次提交未被受理（不产生运行记录），请稍后重试", active, quota.MaxConcurrentTasks)
 			e.audit(domain.AuditEvent{TenantID: tenantID, Category: "quota", Action: "task.submit.rejected",
 				Level: "warn", Message: msg, RequestID: req.RequestID})
 			return nil, fmt.Errorf("%w: %s", ErrQuotaExceeded, msg)
@@ -408,7 +655,7 @@ func (e *Engine) submit(ctx context.Context, tenantID string, req domain.CreateT
 
 	run := &domain.TaskRun{
 		ID: uuid.NewString(), TaskID: task.ID, TenantID: tenantID,
-		Attempt: attempt, Mode: mode, State: domain.StateQueued,
+		Attempt: attempt, Priority: req.Priority, Mode: mode, State: domain.StateQueued,
 		Title: req.Title, Environment: req.Environment,
 		Stacktrace: req.Stacktrace, Logs: req.Logs,
 		RequestedRef: req.Ref, RepoIDs: append([]string{}, repoIDs...),
@@ -416,7 +663,7 @@ func (e *Engine) submit(ctx context.Context, tenantID string, req domain.CreateT
 		IdempotencyKey: key, RequestID: firstNonEmpty(opts.requestID, req.RequestID),
 		CallbackURL:    req.CallbackURL,
 		CallerAPIKeyID: req.CallerAPIKeyID,
-		CreatedAt:   now, UpdatedAt: now,
+		CreatedAt:      now, UpdatedAt: now,
 	}
 	if opts.base != nil {
 		// 多轮修复：复用固化上下文，保证"同一份代码、同一份堆栈"（CONTRACT §6.8）。
@@ -470,12 +717,16 @@ func (e *Engine) submit(ctx context.Context, tenantID string, req domain.CreateT
 		return nil, fmt.Errorf("创建执行记录失败：%w", err)
 	}
 
-	// 入队：队列满时按"快速失败"策略拒绝，而不是在 HTTP 处理线程里同步执行
-	// （CONTRACT §6.9 要求 worker pool 无阻塞，同步执行会让接入层被长任务拖垮）。
-	select {
-	case e.queue <- run.ID:
-	default:
-		msg := "任务队列已满，请稍后重试"
+	// 入队（队列按 Priority 择优出队）：队列满时按"快速失败"策略拒绝，
+	// 而不是在 HTTP 处理线程里同步执行（CONTRACT §6.9 要求 worker pool 无阻塞，
+	// 同步执行会让接入层被长任务拖垮）。
+	if qerr := e.queue.Push(run.ID, run.Priority); qerr != nil {
+		// 同上：含"配额"关键词以映射 429 + Retry-After。
+		// 引擎未启动/已停止时同样按"稍后重试"处理，避免调用方无限等待。
+		msg := "任务队列已满（配额），请稍后重试"
+		if errors.Is(qerr, ErrQueueClosed) {
+			msg = "调度引擎未运行，任务未被受理（配额），请稍后重试"
+		}
 		from := run.State
 		run.State = domain.StateFailed
 		run.Error = msg
@@ -685,7 +936,9 @@ func (e *Engine) execute(runID string) {
 		e.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(e.baseCtx, e.cfg.TaskTimeout())
+	// 超时优先取租户配额 MaxTaskSeconds，未配置时回退全局 engine.taskTimeoutSec。
+	timeout := e.taskTimeoutFor(run.TenantID)
+	ctx, cancel := context.WithTimeout(e.baseCtx, timeout)
 	ctx, cancel2 := context.WithCancel(ctx)
 	h := &runHandle{cancel: func() { cancel2(); cancel() }, state: run.State}
 	e.running[runID] = h
@@ -698,6 +951,12 @@ func (e *Engine) execute(runID string) {
 		delete(e.running, runID)
 		e.mu.Unlock()
 	}()
+
+	// 执行期心跳：多实例部署时，其他实例启动会扫描"非终态且陈旧"的运行做僵尸回收，
+	// 长任务若不刷新更新时间会被误判回收。心跳只刷新 UpdatedAt，不改动其他字段。
+	hbStop := make(chan struct{})
+	go e.runHeartbeat(runID, hbStop)
+	defer close(hbStop)
 
 	run.StartedAt = time.Now()
 	run.UpdatedAt = run.StartedAt
@@ -722,7 +981,7 @@ func (e *Engine) execute(runID string) {
 		target = domain.StateCancelled
 	case err != nil:
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			run.Error = fmt.Sprintf("任务执行超时（%s）", e.cfg.TaskTimeout())
+			run.Error = fmt.Sprintf("任务执行超时（%s）", timeout)
 		} else {
 			run.Error = err.Error()
 		}
@@ -768,6 +1027,25 @@ func (e *Engine) execute(runID string) {
 	}
 	if run.CallbackURL != "" && run.State != domain.StateCancelled {
 		e.fireCallback(run, report)
+	}
+}
+
+// runHeartbeat 执行期心跳：周期性刷新运行的更新时间，直到 stop 关闭或运行进入终态。
+func (e *Engine) runHeartbeat(runID string, stop <-chan struct{}) {
+	ticker := time.NewTicker(runHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			run, ok := e.st.GetRunRaw(runID)
+			if !ok || run.State.IsTerminal() {
+				return
+			}
+			run.UpdatedAt = time.Now()
+			_ = e.st.UpdateRun(run)
+		}
 	}
 }
 
@@ -1072,7 +1350,10 @@ func (e *Engine) Stats(ctx context.Context, tenantID string) (*domain.EngineStat
 }
 
 // QueueLen 返回当前排队中的任务数（并发安全）。
-func (e *Engine) QueueLen() int { return len(e.queue) }
+func (e *Engine) QueueLen() int { return e.queue.Len() }
+
+// QueueSnapshot 返回当前排队任务（按出队顺序），供运维观测与诊断。
+func (e *Engine) QueueSnapshot() []queueItem { return e.queue.Snapshot() }
 
 // RunningCount 返回当前正在执行的任务数（并发安全）。
 func (e *Engine) RunningCount() int {
@@ -1150,10 +1431,10 @@ func (e *Engine) fireCallback(run *domain.TaskRun, report *domain.Report) {
 		payload.RootCause = run.RootCause
 	}
 	for _, p := range run.Patches {
-	payload.Patches = append(payload.Patches, callbackPatch{
-		RepositoryID: p.RepositoryID, RepoKey: p.RepoKey, FilePath: p.FilePath,
-		Action: string(p.Action), UnifiedDiff: p.UnifiedDiff, Rationale: p.Rationale,
-	})
+		payload.Patches = append(payload.Patches, callbackPatch{
+			RepositoryID: p.RepositoryID, RepoKey: p.RepoKey, FilePath: p.FilePath,
+			Action: string(p.Action), UnifiedDiff: p.UnifiedDiff, Rationale: p.Rationale,
+		})
 	}
 	if e.publicURL != "" && run.ReportID != "" {
 		payload.ReportURL = e.publicURL + "/r/" + run.ReportID

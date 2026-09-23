@@ -44,7 +44,7 @@ type Deps struct {
 	// Cfg 全系统配置；为 nil 时使用 config.Default()。
 	Cfg *config.Config
 	// Store 数据访问层；为 nil 时使用空的内存 store。
-	Store *store.Store
+	Store store.Store
 	// Auth 认证授权（第二层）；为 nil 时放行并注入匿名主体（仅单测）。
 	Auth domain.Authorizer
 	// Engine Agent 核心调度层；为 nil 时任务写操作返回 503。
@@ -76,7 +76,7 @@ type Deps struct {
 // Server 接入层服务：持有全部依赖、路由与 WebSocket hub。
 type Server struct {
 	cfg    *config.Config
-	st     *store.Store
+	st     store.Store
 	auth   domain.Authorizer
 	engine domain.TaskEngine
 	repos  domain.RepoIndex
@@ -102,7 +102,7 @@ type Server struct {
 //
 // 行为：
 //   - Cfg 为 nil → config.Default()；Store 为 nil → store.New() 且 Repos 走空适配器；
-//   - Repos 为 nil → 自动使用 handler.NewStoreRepoIndex（*store.Store 与 domain.RepoIndex
+//   - Repos 为 nil → 自动使用 handler.NewStoreRepoIndex（store.Store 与 domain.RepoIndex
 //     存在签名差异，详见 internal/api/deps.go 的适配器说明）；
 //   - Bus 非 nil 时创建 WebSocket Hub（连接上限 500）。
 func NewServer(d Deps) (*Server, error) {
@@ -187,7 +187,7 @@ func (s *Server) Handler() http.Handler {
 	return s.h
 }
 
-// handlerDeps 组装 handler 层依赖（已把 *store.Store 适配为 domain.RepoIndex）。
+// handlerDeps 组装 handler 层依赖（已把 store.Store 适配为 domain.RepoIndex）。
 func (s *Server) handlerDeps() *handler.Deps {
 	return &handler.Deps{
 		Cfg:      s.cfg,

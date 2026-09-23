@@ -288,7 +288,7 @@ func (c *fileCache) totalBytes() int64 {
 // Resolver domain.SourceResolver 的默认实现。
 type Resolver struct {
 	cfg     config.SourceConfig
-	store   *store.Store
+	store   store.Store
 	secrets SecretProvider
 	log     *logx.Logger
 	git     *GitRepoManager
@@ -312,7 +312,7 @@ var _ domain.SourceResolver = (*Resolver)(nil)
 //
 // st 用于读取仓库元数据（可为 nil，此时调用方必须通过 domain.RepoRef.Repository 传入仓库）；
 // secrets 可为 nil（无凭证，仅支持匿名/本地仓库）。
-func NewResolver(cfg config.SourceConfig, st *store.Store, secrets SecretProvider, log *logx.Logger) *Resolver {
+func NewResolver(cfg config.SourceConfig, st store.Store, secrets SecretProvider, log *logx.Logger) *Resolver {
 	if log == nil {
 		log = logx.Nop()
 	}

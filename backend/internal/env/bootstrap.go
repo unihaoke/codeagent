@@ -38,7 +38,7 @@ type SeedResult struct {
 //
 // 仅做一件事：没有租户时补建一个，否则原样返回。
 // 控制台登录后即可自行创建租户、仓库、分组、凭证与接入密钥。
-func EnsureSeed(ctx context.Context, st *store.Store) (*SeedResult, error) {
+func EnsureSeed(ctx context.Context, st store.Store) (*SeedResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -65,7 +65,7 @@ func EnsureSeed(ctx context.Context, st *store.Store) (*SeedResult, error) {
 }
 
 // ensureTenant 确保租户存在（先查后建，重复调用幂等）。
-func ensureTenant(st *store.Store, t *domain.Tenant, now time.Time) (bool, error) {
+func ensureTenant(st store.Store, t *domain.Tenant, now time.Time) (bool, error) {
 	if _, ok := st.GetTenant(t.ID); ok {
 		return false, nil
 	}

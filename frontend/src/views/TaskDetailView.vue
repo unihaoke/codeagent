@@ -599,11 +599,18 @@ async function doCancel(): Promise<void> {
       toastWarn('取消请求已发送，但任务可能已进入终态')
     }
   } catch (e) {
-    toastError('取消失败', errMsg(e))
+    // 409：任务已进入终态，后端拒绝取消。此时 UI 多半还停留在排队中（旧快照），
+    // 必须明确告知真实状态而不是笼统报"取消失败"，否则用户会反复点击。
+    if (e instanceof ApiError && e.code === 409) {
+      toastWarn(`任务已结束，无法取消：${e.message || '状态冲突'}`)
+    } else {
+      toastError('取消失败', errMsg(e))
+    }
   } finally {
     acting.value = false
     // 无论取消成功与否都重新拉取权威状态，避免 UI 停留在旧快照
     // （例如后端已终态而前端仍显示排队中，导致重复点击取消报冲突）。
+    // 终态回读后 canCancel 自动为 false，取消按钮随即置灰。
     await runAsync.reload()
   }
 }

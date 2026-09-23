@@ -69,7 +69,7 @@ const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 // Auth 认证授权中心：API Key 校验、控制台 JWT、越权拦截。
 type Auth struct {
 	cfg    *config.Config
-	st     *store.Store
+	st     store.Store
 	secret []byte
 	ttl    time.Duration
 
@@ -84,7 +84,7 @@ type Auth struct {
 var _ domain.Authorizer = (*Auth)(nil)
 
 // NewAuth 创建认证授权中心。
-func NewAuth(cfg *config.Config, st *store.Store) *Auth {
+func NewAuth(cfg *config.Config, st store.Store) *Auth {
 	if cfg == nil {
 		cfg = config.Default()
 	}

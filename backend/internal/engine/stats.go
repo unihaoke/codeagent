@@ -33,7 +33,7 @@ type DayBucket struct {
 //   - AvgElapsedMS = 仅统计已结束（EndedAt 非零）的运行，避免运行中任务的耗时污染均值
 //   - RepoSwitches = 各运行 Resolution 长度累加（每次仓库版本锁定计一次）
 //   - DegradedRuns = Degraded 为真的运行数
-func BuildEngineStats(st *store.Store, tenantID string) (*domain.EngineStats, error) {
+func BuildEngineStats(st store.Store, tenantID string) (*domain.EngineStats, error) {
 	if st == nil {
 		return nil, fmt.Errorf("数据访问层不能为空，无法聚合运行统计")
 	}

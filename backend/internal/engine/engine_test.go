@@ -74,7 +74,7 @@ func (p *scriptedPipeline) callCount() int {
 }
 
 // newEngineForTest 构造带租户与仓库的引擎并启动。
-func newEngineForTest(t *testing.T, cfg *config.Config, pipe domain.TaskPipeline, quota domain.TenantQuota) (*Engine, *store.Store) {
+func newEngineForTest(t *testing.T, cfg *config.Config, pipe domain.TaskPipeline, quota domain.TenantQuota) (*Engine, store.Store) {
 	t.Helper()
 	st := store.New()
 	if err := st.CreateTenant(&domain.Tenant{
@@ -235,6 +235,60 @@ func TestSubmitQueueFullFailsFast(t *testing.T) {
 		t.Error("队列满的任务未落库")
 	}
 	close(block)
+}
+
+// TestReapStaleRunsReleasesQuota 验证僵尸运行会被回收，从而释放租户并发额度。
+//
+// 背景：countActive 把 queued/analyzing/repairing/verifying 全部计入占用，进程重启
+// 遗留的非终态记录会让额度永久泄漏，表现为"跑一段时间后提交一直报配额上限"。
+func TestReapStaleRunsReleasesQuota(t *testing.T) {
+	cfg := config.Default()
+	cfg.Engine.Workers = 1
+	cfg.Engine.QueueSize = 4
+	cfg.Engine.TaskTimeoutSec = 60 // 缩短超时窗口，避免测试依赖真实的 900s
+	eng, st := newEngineForTest(t, cfg, &scriptedPipeline{}, domain.DefaultQuota())
+	defer func() { _ = eng.Stop() }()
+
+	// 僵尸：远超（任务超时 + 宽限）未更新。
+	stale := &domain.TaskRun{
+		ID: "run-stale", TaskID: "task-stale", TenantID: testTenantID,
+		Attempt: 1, Mode: domain.ModeSingleRepo, State: domain.StateAnalyzing,
+		Stacktrace: "stale-stack",
+		CreatedAt:  time.Now().Add(-2 * time.Hour),
+		UpdatedAt:  time.Now().Add(-2 * time.Hour),
+	}
+	if err := st.CreateRun(stale); err != nil {
+		t.Fatalf("构造僵尸运行失败: %v", err)
+	}
+	// 进行中：刚更新过，不应被误回收。
+	fresh := &domain.TaskRun{
+		ID: "run-fresh", TaskID: "task-fresh", TenantID: testTenantID,
+		Attempt: 1, Mode: domain.ModeSingleRepo, State: domain.StateAnalyzing,
+		Stacktrace: "fresh-stack",
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := st.CreateRun(fresh); err != nil {
+		t.Fatalf("构造进行中运行失败: %v", err)
+	}
+
+	if n := eng.reapStaleRuns(); n != 1 {
+		t.Fatalf("应回收 1 条僵尸运行，实际 %d", n)
+	}
+	got, ok := st.GetRunRaw("run-stale")
+	if !ok {
+		t.Fatal("僵尸运行记录丢失")
+	}
+	if got.State != domain.StateFailed {
+		t.Errorf("僵尸运行应置 failed，实际 %s", got.State)
+	}
+	if got.EndedAt.IsZero() {
+		t.Error("回收后的运行应写入 EndedAt")
+	}
+	still, ok := st.GetRunRaw("run-fresh")
+	if !ok || still.State != domain.StateAnalyzing {
+		t.Errorf("进行中的运行不应被回收，实际 %+v", still)
+	}
 }
 
 // ---------------------------------------------------------------------------

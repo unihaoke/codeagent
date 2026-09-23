@@ -20,7 +20,7 @@ const (
 )
 
 // newRecorder 构造带真实事件总线的记录器。
-func newRecorder(t *testing.T) (*Recorder, *store.Store, *eventbus.Bus) {
+func newRecorder(t *testing.T) (*Recorder, store.Store, *eventbus.Bus) {
 	t.Helper()
 	st := store.New()
 	bus := eventbus.New(128)
@@ -28,7 +28,7 @@ func newRecorder(t *testing.T) (*Recorder, *store.Store, *eventbus.Bus) {
 }
 
 // seedRun 写入执行记录。
-func seedRun(t *testing.T, st *store.Store, run domain.TaskRun) {
+func seedRun(t *testing.T, st store.Store, run domain.TaskRun) {
 	t.Helper()
 	if err := st.CreateRun(&run); err != nil {
 		t.Fatalf("写入运行 %s 失败: %v", run.ID, err)
@@ -36,7 +36,7 @@ func seedRun(t *testing.T, st *store.Store, run domain.TaskRun) {
 }
 
 // seedTask 写入逻辑任务。
-func seedTask(t *testing.T, st *store.Store, task domain.Task) {
+func seedTask(t *testing.T, st store.Store, task domain.Task) {
 	t.Helper()
 	if err := st.CreateTask(&task); err != nil {
 		t.Fatalf("写入任务 %s 失败: %v", task.ID, err)

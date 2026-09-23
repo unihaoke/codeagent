@@ -135,22 +135,18 @@ func (d *Deps) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// writeSSE 以 `data: <json>\n\n`（前缀 id/event 便于客户端断线续传）写出一条事件。
+// writeSSE 以 `data: <json>\n\n` 写出一条事件，保留 `id:` 供断线续传（Last-Event-ID）。
+//
+// 注意：不写 `event:` 字段。浏览器 EventSource 只在未指定 event 名时投递到 onmessage，
+// 一旦带 event 名就必须用 addEventListener 逐个注册，否则事件被静默丢弃（表现为
+// 阶段进度条不推进、状态不更新）。统一走默认 message 通道，客户端无需维护事件名白名单。
 func writeSSE(w http.ResponseWriter, ev domain.Event) error {
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, sseEventName(ev.Type), raw)
+	_, err = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", ev.Seq, raw)
 	return err
-}
-
-// sseEventName 归一化 SSE event 名（点号替换为下划线，避免部分客户端解析歧义）。
-func sseEventName(t string) string {
-	if t == "" {
-		return "message"
-	}
-	return strings.ReplaceAll(t, ".", "_")
 }
 
 // ---------------------------------------------------------------------------

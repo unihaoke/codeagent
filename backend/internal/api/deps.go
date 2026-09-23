@@ -37,7 +37,7 @@ type Deps struct {
 	// Cfg 全系统配置（保证非 nil）。
 	Cfg *config.Config
 	// Store 数据访问层（保证非 nil）。
-	Store *store.Store
+	Store store.Store
 	// Auth 认证授权；为 nil 时按未装配处理。
 	Auth domain.Authorizer
 	// Engine Agent 核心调度层；为 nil 时任务写操作返回 503。
@@ -141,14 +141,14 @@ func isNilInterface(v any) bool {
 }
 
 // ---------------------------------------------------------------------------
-// 仓库索引适配器：*store.Store → domain.RepoIndex
+// 仓库索引适配器：store.Store → domain.RepoIndex
 // ---------------------------------------------------------------------------
 
-// NewStoreRepoIndex 把 *store.Store 适配为 domain.RepoIndex。
+// NewStoreRepoIndex 把 store.Store 适配为 domain.RepoIndex。
 //
 // 适配原因（签名差异，两方均不可修改）：
 //
-//	| domain.RepoIndex                                  | *store.Store                                  |
+//	| domain.RepoIndex                                  | store.Store                                  |
 //	|---------------------------------------------------|-----------------------------------------------|
 //	| GetRepo(ctx, tenantID, id) (*Repository, error)    | GetRepo(tenantID, id) (*Repository, bool)     |
 //	| ListRepos(ctx, tenantID, q PageQuery) (Page, err)  | ListRepos(tenantID) []Repository              |
@@ -161,12 +161,12 @@ func isNilInterface(v any) bool {
 //   - 把 `(值, false)` 映射为 store.ErrNotFound；
 //   - 为列表方法补齐关键字过滤与分页语义（与 store.ListTasks 行为一致）；
 //   - 区分"分组不存在"与"分组为空"（GroupMembers 空结果时回查分组）。
-func NewStoreRepoIndex(st *store.Store) domain.RepoIndex {
+func NewStoreRepoIndex(st store.Store) domain.RepoIndex {
 	return &repoIndexAdapter{st: st}
 }
 
 // repoIndexAdapter 见 NewStoreRepoIndex 的说明。
-type repoIndexAdapter struct{ st *store.Store }
+type repoIndexAdapter struct{ st store.Store }
 
 // ListRepos 实现 domain.RepoIndex：关键字过滤 + 分页。
 func (a *repoIndexAdapter) ListRepos(ctx context.Context, tenantID string, q domain.PageQuery) (domain.Page[domain.Repository], error) {
@@ -448,7 +448,7 @@ func (p *engineProvider) Observability(ctx context.Context, tenantID string) (*d
 }
 
 // storeProvider 纯 Store 数据访问实现（Engine/Recorder 均缺失时使用）。
-type storeProvider struct{ st *store.Store }
+type storeProvider struct{ st store.Store }
 
 func (p *storeProvider) GetRun(ctx context.Context, tenantID, runID string) (*domain.TaskRun, error) {
 	if err := ctxErr(ctx); err != nil {
@@ -504,7 +504,7 @@ func nonNilPage[T any](p domain.Page[T]) domain.Page[T] {
 }
 
 // aggregateObservability 在无 Recorder 时基于 Store 聚合可观测汇总。
-func aggregateObservability(st *store.Store, tenantID string) *domain.ObservabilitySummary {
+func aggregateObservability(st store.Store, tenantID string) *domain.ObservabilitySummary {
 	runs := st.AllRuns(tenantID)
 	skillCalls := st.AllSkillCalls(tenantID)
 	modelCalls := st.AllModelCalls(tenantID)
@@ -668,6 +668,11 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if err == nil {
 		return
 	}
+	// 配额/限流类错误统一带 Retry-After，让调用方按建议间隔退避重试，
+	// 而不是立刻疯狂重试把额度打满（此类错误不会产生运行记录）。
+	if isQuotaLimited(err) {
+		w.Header().Set("Retry-After", retryAfterSeconds)
+	}
 	var apiErr *httpx.APIError
 	if errors.As(err, &apiErr) {
 		httpx.WriteError(w, r, apiErr)
@@ -683,6 +688,18 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	default:
 		httpx.WriteError(w, r, mapByText(err))
 	}
+}
+
+// retryAfterSeconds 配额/限流错误建议的重试等待秒数（Retry-After 响应头）。
+const retryAfterSeconds = "5"
+
+// isQuotaLimited 判断错误是否属于配额/限流类，判定口径与 mapByText 的配额分支一致。
+func isQuotaLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return containsAny(low, "quota", "rate limit", "too many requests", "配额", "限流", "超过上限")
 }
 
 // mapByText 按错误文本兜底映射（目标包未导出错误变量时的降级策略）。

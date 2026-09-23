@@ -79,6 +79,9 @@ type EngineConfig struct {
 	IdempotencyTTLSec int `json:"idempotencyTtlSec"`
 	// MaxRepairRounds 单任务最大"修复-验证"迭代轮数，保证收敛。
 	MaxRepairRounds int `json:"maxRepairRounds"`
+	// QueueJournalFile 队列日志文件：入队/出队追加写盘，进程重启后据此恢复排队任务。
+	// 为空时随数据快照同目录（data/queue.journal）；设为 "-" 表示关闭持久化。
+	QueueJournalFile string `json:"queueJournalFile"`
 	// AutoFix 是否自动产出补丁（关闭则只做根因分析）。
 	AutoFix bool `json:"autoFix"`
 }
@@ -215,10 +218,18 @@ type SkillOverride struct {
 
 // StoreConfig 持久化配置。
 type StoreConfig struct {
-	Driver   string `json:"driver"` // memory | file
+	// Driver 存储实现：memory（进程内存）| file（内存 + JSON 快照）| sql（共享存储，支持多实例）。
+	Driver   string `json:"driver"`
 	DataFile string `json:"dataFile"`
-	// SnapshotIntervalSec 落盘节流间隔。
+	// SnapshotIntervalSec 落盘节流间隔（file 模式）。
 	SnapshotIntervalSec int `json:"snapshotIntervalSec"`
+	// SQLDriver 共享存储的 database/sql 驱动名（postgres / mysql / sqlite），
+	// 需已注册到 database/sql（默认构建不引入任何驱动，按需以 build tag 编译）。
+	SQLDriver string `json:"sqlDriver"`
+	// DSN 共享存储连接串（driver=sql 时必填）。
+	DSN string `json:"dsn"`
+	// SQLDialect 方言覆盖（postgres / mysql / sqlite）；为空时按 SQLDriver 推断。
+	SQLDialect string `json:"sqlDialect"`
 }
 
 // LogConfig 日志配置。
@@ -396,6 +407,9 @@ func applyEnv(c *Config) {
 	env("MODEL_NAME", &c.mcpModel)
 	env("STORE_DRIVER", &c.Store.Driver)
 	env("STORE_FILE", &c.Store.DataFile)
+	env("STORE_SQL_DRIVER", &c.Store.SQLDriver)
+	env("STORE_DSN", &c.Store.DSN)
+	env("STORE_SQL_DIALECT", &c.Store.SQLDialect)
 	env("LOG_LEVEL", &c.Log.Level)
 	env("LOG_FORMAT", &c.Log.Format)
 }
@@ -428,6 +442,10 @@ func (c *Config) Validate() error {
 	}
 	if c.Store.Driver == "" {
 		c.Store.Driver = "memory"
+	}
+	// sql 模式必须提供驱动与连接串：缺失时退回文件快照，避免启动到半可用状态。
+	if strings.EqualFold(c.Store.Driver, "sql") && (strings.TrimSpace(c.Store.SQLDriver) == "" || strings.TrimSpace(c.Store.DSN) == "") {
+		return fmt.Errorf("store.driver=sql 时必须配置 store.sqlDriver 与 store.dsn")
 	}
 	if c.MCP.Default == "" {
 		c.MCP.Default = "default"

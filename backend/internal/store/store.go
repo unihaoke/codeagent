@@ -2,7 +2,7 @@
 //
 // 默认提供"内存索引 + JSON 快照"实现：单机部署零依赖即可运行，
 // 同时通过 Store 结构体暴露的方法集，可平滑替换为 PostgreSQL 等实现
-// （只需保持方法签名不变，各层通过 *store.Store 依赖注入）。
+// （只需保持方法签名不变，各层通过 store.Store 依赖注入）。
 package store
 
 import (
@@ -18,8 +18,8 @@ import (
 	"github.com/codeagent/backend/internal/domain"
 )
 
-// Store 内存索引存储 + 可选 JSON 快照持久化。
-type Store struct {
+// MemStore 内存索引存储 + 可选 JSON 快照持久化（Store 的默认实现）。
+type MemStore struct {
 	mu sync.RWMutex
 
 	tenants  map[string]*domain.Tenant
@@ -47,23 +47,26 @@ type Store struct {
 	snapMu   sync.Mutex
 }
 
+// 编译期校验：MemStore 必须完整实现 Store 契约。
+var _ Store = (*MemStore)(nil)
+
 // New 创建内存存储。
-func New() *Store {
-	return &Store{
-		tenants:   map[string]*domain.Tenant{},
-		apiKeys:   map[string]*domain.APIKey{},
-		creds:     map[string]*domain.Credential{},
-		repos:     map[string]*domain.Repository{},
-		groups:    map[string]*domain.RepositoryGroup{},
-		members:   []domain.GroupMember{},
-		tasks:     map[string]*domain.Task{},
-		runs:      map[string]*domain.TaskRun{},
-		reports:   map[string]*domain.Report{},
-		audits:    []domain.AuditEvent{},
-		skillLog:  []domain.SkillCall{},
-		modelLog:  []domain.ModelCall{},
+func New() Store {
+	return &MemStore{
+		tenants:        map[string]*domain.Tenant{},
+		apiKeys:        map[string]*domain.APIKey{},
+		creds:          map[string]*domain.Credential{},
+		repos:          map[string]*domain.Repository{},
+		groups:         map[string]*domain.RepositoryGroup{},
+		members:        []domain.GroupMember{},
+		tasks:          map[string]*domain.Task{},
+		runs:           map[string]*domain.TaskRun{},
+		reports:        map[string]*domain.Report{},
+		audits:         []domain.AuditEvent{},
+		skillLog:       []domain.SkillCall{},
+		modelLog:       []domain.ModelCall{},
 		modelProviders: map[string]*domain.ModelProviderConfig{},
-		idemIndex: map[string]string{},
+		idemIndex:      map[string]string{},
 	}
 }
 
@@ -91,8 +94,10 @@ type snapshot struct {
 }
 
 // OpenFile 以文件快照模式打开存储（文件不存在则新建）。
-func OpenFile(path string, snapshotInterval time.Duration) (*Store, error) {
-	s := New()
+//
+// 返回 Store 接口：调用方无需关心底层是内存还是共享存储，便于平滑切换。
+func OpenFile(path string, snapshotInterval time.Duration) (Store, error) {
+	s := New().(*MemStore)
 	s.dataFile = path
 	if path != "" {
 		raw, err := os.ReadFile(path)
@@ -113,7 +118,7 @@ func OpenFile(path string, snapshotInterval time.Duration) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) loadSnapshot(snap *snapshot) {
+func (s *MemStore) loadSnapshot(snap *snapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, v := range snap.Tenants {
@@ -152,7 +157,7 @@ func (s *Store) loadSnapshot(snap *snapshot) {
 	}
 }
 
-func (s *Store) loop(d time.Duration) {
+func (s *MemStore) loop(d time.Duration) {
 	t := time.NewTicker(d)
 	defer t.Stop()
 	for {
@@ -166,7 +171,7 @@ func (s *Store) loop(d time.Duration) {
 }
 
 // Flush 立即落盘（若配置了数据文件且存在未持久化变更）。
-func (s *Store) Flush() error {
+func (s *MemStore) Flush() error {
 	s.mu.Lock()
 	if s.dataFile == "" || !s.dirty {
 		s.mu.Unlock()
@@ -193,7 +198,7 @@ func (s *Store) Flush() error {
 }
 
 // Close 停止后台落盘并做最后一次 Flush。
-func (s *Store) Close() error {
+func (s *MemStore) Close() error {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
@@ -207,7 +212,7 @@ func (s *Store) Close() error {
 	return s.Flush()
 }
 
-func (s *Store) snapshotLocked() *snapshot {
+func (s *MemStore) snapshotLocked() *snapshot {
 	snap := &snapshot{Version: 1, SavedAt: time.Now()}
 	for _, v := range s.tenants {
 		snap.Tenants = append(snap.Tenants, v)
@@ -267,14 +272,14 @@ func tailModelCalls(in []domain.ModelCall, n int) []domain.ModelCall {
 	return in[len(in)-n:]
 }
 
-func (s *Store) markDirty() { s.dirty = true }
+func (s *MemStore) markDirty() { s.dirty = true }
 
 // ---------------------------------------------------------------------------
 // 租户
 // ---------------------------------------------------------------------------
 
 // CreateTenant 创建租户。
-func (s *Store) CreateTenant(t *domain.Tenant) error {
+func (s *MemStore) CreateTenant(t *domain.Tenant) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *t
@@ -284,7 +289,7 @@ func (s *Store) CreateTenant(t *domain.Tenant) error {
 }
 
 // GetTenant 查询租户。
-func (s *Store) GetTenant(id string) (*domain.Tenant, bool) {
+func (s *MemStore) GetTenant(id string) (*domain.Tenant, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.tenants[id]
@@ -296,7 +301,7 @@ func (s *Store) GetTenant(id string) (*domain.Tenant, bool) {
 }
 
 // GetTenantByKey 按名称/ID 关键字查询租户（用于登录）。
-func (s *Store) GetTenantByKey(key string) (*domain.Tenant, bool) {
+func (s *MemStore) GetTenantByKey(key string) (*domain.Tenant, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, t := range s.tenants {
@@ -309,7 +314,7 @@ func (s *Store) GetTenantByKey(key string) (*domain.Tenant, bool) {
 }
 
 // UpdateTenant 更新租户。
-func (s *Store) UpdateTenant(t *domain.Tenant) error {
+func (s *MemStore) UpdateTenant(t *domain.Tenant) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.tenants[t.ID]; !ok {
@@ -322,7 +327,7 @@ func (s *Store) UpdateTenant(t *domain.Tenant) error {
 }
 
 // ListTenants 列出全部租户。
-func (s *Store) ListTenants() []domain.Tenant {
+func (s *MemStore) ListTenants() []domain.Tenant {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]domain.Tenant, 0, len(s.tenants))
@@ -341,7 +346,7 @@ func (s *Store) ListTenants() []domain.Tenant {
 // ---------------------------------------------------------------------------
 
 // ListModelProviders 返回全部模型提供方配置（按名称升序）。
-func (s *Store) ListModelProviders() []domain.ModelProviderConfig {
+func (s *MemStore) ListModelProviders() []domain.ModelProviderConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]domain.ModelProviderConfig, 0, len(s.modelProviders))
@@ -353,7 +358,7 @@ func (s *Store) ListModelProviders() []domain.ModelProviderConfig {
 }
 
 // GetModelProvider 按名称读取模型提供方配置。
-func (s *Store) GetModelProvider(name string) (*domain.ModelProviderConfig, bool) {
+func (s *MemStore) GetModelProvider(name string) (*domain.ModelProviderConfig, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.modelProviders[strings.TrimSpace(name)]
@@ -365,7 +370,7 @@ func (s *Store) GetModelProvider(name string) (*domain.ModelProviderConfig, bool
 }
 
 // SaveModelProvider 新增或更新模型提供方配置（按 Name 唯一）。
-func (s *Store) SaveModelProvider(c *domain.ModelProviderConfig) error {
+func (s *MemStore) SaveModelProvider(c *domain.ModelProviderConfig) error {
 	if c == nil {
 		return errors.New("store: 模型提供方配置不能为空")
 	}
@@ -387,7 +392,7 @@ func (s *Store) SaveModelProvider(c *domain.ModelProviderConfig) error {
 //
 // AI 设置以提交列表为唯一真源：列表中不存在的旧配置会被删除。
 // 空列表表示清空（模型层随之变为"未配置"状态）。
-func (s *Store) ReplaceModelProviders(list []domain.ModelProviderConfig) error {
+func (s *MemStore) ReplaceModelProviders(list []domain.ModelProviderConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := make(map[string]*domain.ModelProviderConfig, len(list))
@@ -408,7 +413,7 @@ func (s *Store) ReplaceModelProviders(list []domain.ModelProviderConfig) error {
 }
 
 // DeleteModelProvider 删除模型提供方配置；不存在返回 ErrNotFound。
-func (s *Store) DeleteModelProvider(name string) error {
+func (s *MemStore) DeleteModelProvider(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	name = strings.TrimSpace(name)
@@ -428,7 +433,7 @@ func (s *Store) DeleteModelProvider(name string) error {
 //
 // 用途：吊销时先判断"是否存在"，再判断"是否属于当前租户"，
 // 使 404（资源不存在）与 403（越权）语义分离，避免排障时误判。
-func (s *Store) GetAPIKey(id string) (*domain.APIKey, bool) {
+func (s *MemStore) GetAPIKey(id string) (*domain.APIKey, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.apiKeys[id]
@@ -440,7 +445,7 @@ func (s *Store) GetAPIKey(id string) (*domain.APIKey, bool) {
 }
 
 // CreateAPIKey 创建接入密钥。
-func (s *Store) CreateAPIKey(k *domain.APIKey) error {
+func (s *MemStore) CreateAPIKey(k *domain.APIKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *k
@@ -450,7 +455,7 @@ func (s *Store) CreateAPIKey(k *domain.APIKey) error {
 }
 
 // FindAPIKeyByHash 按哈希查找密钥。
-func (s *Store) FindAPIKeyByHash(hash string) (*domain.APIKey, bool) {
+func (s *MemStore) FindAPIKeyByHash(hash string) (*domain.APIKey, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, k := range s.apiKeys {
@@ -463,7 +468,7 @@ func (s *Store) FindAPIKeyByHash(hash string) (*domain.APIKey, bool) {
 }
 
 // ListAPIKeys 列出某租户密钥。
-func (s *Store) ListAPIKeys(tenantID string) []domain.APIKey {
+func (s *MemStore) ListAPIKeys(tenantID string) []domain.APIKey {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.APIKey{}
@@ -477,7 +482,7 @@ func (s *Store) ListAPIKeys(tenantID string) []domain.APIKey {
 }
 
 // TouchAPIKey 记录密钥最近使用时间。
-func (s *Store) TouchAPIKey(id string) {
+func (s *MemStore) TouchAPIKey(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if k, ok := s.apiKeys[id]; ok {
@@ -486,7 +491,7 @@ func (s *Store) TouchAPIKey(id string) {
 }
 
 // RevokeAPIKey 吊销密钥。
-func (s *Store) RevokeAPIKey(tenantID, id string) error {
+func (s *MemStore) RevokeAPIKey(tenantID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k, ok := s.apiKeys[id]
@@ -503,7 +508,7 @@ func (s *Store) RevokeAPIKey(tenantID, id string) error {
 // ---------------------------------------------------------------------------
 
 // CreateCredential 创建凭证。
-func (s *Store) CreateCredential(c *domain.Credential) error {
+func (s *MemStore) CreateCredential(c *domain.Credential) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *c
@@ -513,7 +518,7 @@ func (s *Store) CreateCredential(c *domain.Credential) error {
 }
 
 // GetCredential 查询凭证。
-func (s *Store) GetCredential(tenantID, id string) (*domain.Credential, bool) {
+func (s *MemStore) GetCredential(tenantID, id string) (*domain.Credential, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	c, ok := s.creds[id]
@@ -525,7 +530,7 @@ func (s *Store) GetCredential(tenantID, id string) (*domain.Credential, bool) {
 }
 
 // ListCredentials 列出凭证。
-func (s *Store) ListCredentials(tenantID string) []domain.Credential {
+func (s *MemStore) ListCredentials(tenantID string) []domain.Credential {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.Credential{}
@@ -541,7 +546,7 @@ func (s *Store) ListCredentials(tenantID string) []domain.Credential {
 }
 
 // UpdateCredential 更新凭证。
-func (s *Store) UpdateCredential(c *domain.Credential) error {
+func (s *MemStore) UpdateCredential(c *domain.Credential) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.creds[c.ID]; !ok {
@@ -554,7 +559,7 @@ func (s *Store) UpdateCredential(c *domain.Credential) error {
 }
 
 // DeleteCredential 删除凭证。
-func (s *Store) DeleteCredential(tenantID, id string) error {
+func (s *MemStore) DeleteCredential(tenantID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c, ok := s.creds[id]
@@ -571,7 +576,7 @@ func (s *Store) DeleteCredential(tenantID, id string) error {
 // ---------------------------------------------------------------------------
 
 // CreateRepo 创建仓库索引。
-func (s *Store) CreateRepo(r *domain.Repository) error {
+func (s *MemStore) CreateRepo(r *domain.Repository) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.repos {
@@ -586,7 +591,7 @@ func (s *Store) CreateRepo(r *domain.Repository) error {
 }
 
 // GetRepo 查询仓库。
-func (s *Store) GetRepo(tenantID, id string) (*domain.Repository, bool) {
+func (s *MemStore) GetRepo(tenantID, id string) (*domain.Repository, bool) {
 	if id == "" {
 		return nil, false
 	}
@@ -601,7 +606,7 @@ func (s *Store) GetRepo(tenantID, id string) (*domain.Repository, bool) {
 }
 
 // GetRepoByKey 按业务键查询仓库。
-func (s *Store) GetRepoByKey(tenantID, key string) (*domain.Repository, bool) {
+func (s *MemStore) GetRepoByKey(tenantID, key string) (*domain.Repository, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, r := range s.repos {
@@ -614,7 +619,7 @@ func (s *Store) GetRepoByKey(tenantID, key string) (*domain.Repository, bool) {
 }
 
 // UpdateRepo 更新仓库。
-func (s *Store) UpdateRepo(r *domain.Repository) error {
+func (s *MemStore) UpdateRepo(r *domain.Repository) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.repos[r.ID]; !ok {
@@ -627,7 +632,7 @@ func (s *Store) UpdateRepo(r *domain.Repository) error {
 }
 
 // DeleteRepo 删除仓库及其分组成员关系。
-func (s *Store) DeleteRepo(tenantID, id string) error {
+func (s *MemStore) DeleteRepo(tenantID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.repos[id]
@@ -647,7 +652,7 @@ func (s *Store) DeleteRepo(tenantID, id string) error {
 }
 
 // ListRepos 列出仓库。
-func (s *Store) ListRepos(tenantID string) []domain.Repository {
+func (s *MemStore) ListRepos(tenantID string) []domain.Repository {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.Repository{}
@@ -665,7 +670,7 @@ func (s *Store) ListRepos(tenantID string) []domain.Repository {
 // ---------------------------------------------------------------------------
 
 // CreateGroup 创建分组及成员关系。
-func (s *Store) CreateGroup(g *domain.RepositoryGroup, members []domain.GroupMember) error {
+func (s *MemStore) CreateGroup(g *domain.RepositoryGroup, members []domain.GroupMember) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.groups {
@@ -690,7 +695,7 @@ func (s *Store) CreateGroup(g *domain.RepositoryGroup, members []domain.GroupMem
 }
 
 // GetGroup 查询分组。
-func (s *Store) GetGroup(tenantID, id string) (*domain.RepositoryGroup, bool) {
+func (s *MemStore) GetGroup(tenantID, id string) (*domain.RepositoryGroup, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	g, ok := s.groups[id]
@@ -702,7 +707,7 @@ func (s *Store) GetGroup(tenantID, id string) (*domain.RepositoryGroup, bool) {
 }
 
 // UpdateGroup 更新分组与成员。
-func (s *Store) UpdateGroup(g *domain.RepositoryGroup, members []domain.GroupMember) error {
+func (s *MemStore) UpdateGroup(g *domain.RepositoryGroup, members []domain.GroupMember) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.groups[g.ID]; !ok {
@@ -734,7 +739,7 @@ func (s *Store) UpdateGroup(g *domain.RepositoryGroup, members []domain.GroupMem
 }
 
 // DeleteGroup 删除分组及成员关系。
-func (s *Store) DeleteGroup(tenantID, id string) error {
+func (s *MemStore) DeleteGroup(tenantID, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	g, ok := s.groups[id]
@@ -754,7 +759,7 @@ func (s *Store) DeleteGroup(tenantID, id string) error {
 }
 
 // ListGroups 列出分组。
-func (s *Store) ListGroups(tenantID string) []domain.RepositoryGroup {
+func (s *MemStore) ListGroups(tenantID string) []domain.RepositoryGroup {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.RepositoryGroup{}
@@ -768,7 +773,7 @@ func (s *Store) ListGroups(tenantID string) []domain.RepositoryGroup {
 }
 
 // GroupMemberViews 返回分组成员聚合视图（按 Order 升序）。
-func (s *Store) GroupMemberViews(tenantID, groupID string) []domain.GroupMemberView {
+func (s *MemStore) GroupMemberViews(tenantID, groupID string) []domain.GroupMemberView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.GroupMemberView{}
@@ -788,7 +793,7 @@ func (s *Store) GroupMemberViews(tenantID, groupID string) []domain.GroupMemberV
 }
 
 // GroupMemberRepoIDs 返回分组内仓库 ID 列表。
-func (s *Store) GroupMemberRepoIDs(groupID string) []string {
+func (s *MemStore) GroupMemberRepoIDs(groupID string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []string{}
@@ -801,7 +806,7 @@ func (s *Store) GroupMemberRepoIDs(groupID string) []string {
 }
 
 // GroupsOfRepo 反查仓库所属分组。
-func (s *Store) GroupsOfRepo(tenantID, repoID string) []domain.RepositoryGroup {
+func (s *MemStore) GroupsOfRepo(tenantID, repoID string) []domain.RepositoryGroup {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.RepositoryGroup{}
@@ -821,7 +826,7 @@ func (s *Store) GroupsOfRepo(tenantID, repoID string) []domain.RepositoryGroup {
 // ---------------------------------------------------------------------------
 
 // CreateTask 创建逻辑任务。
-func (s *Store) CreateTask(t *domain.Task) error {
+func (s *MemStore) CreateTask(t *domain.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *t
@@ -831,7 +836,7 @@ func (s *Store) CreateTask(t *domain.Task) error {
 }
 
 // UpdateTask 更新逻辑任务。
-func (s *Store) UpdateTask(t *domain.Task) error {
+func (s *MemStore) UpdateTask(t *domain.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.tasks[t.ID]; !ok {
@@ -844,7 +849,7 @@ func (s *Store) UpdateTask(t *domain.Task) error {
 }
 
 // GetTask 查询任务。
-func (s *Store) GetTask(tenantID, id string) (*domain.Task, bool) {
+func (s *MemStore) GetTask(tenantID, id string) (*domain.Task, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	t, ok := s.tasks[id]
@@ -856,7 +861,7 @@ func (s *Store) GetTask(tenantID, id string) (*domain.Task, bool) {
 }
 
 // ListTasks 列出任务（按更新时间倒序）。
-func (s *Store) ListTasks(tenantID string, q domain.PageQuery) domain.Page[domain.Task] {
+func (s *MemStore) ListTasks(tenantID string, q domain.PageQuery) domain.Page[domain.Task] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	q.Normalize()
@@ -875,7 +880,7 @@ func (s *Store) ListTasks(tenantID string, q domain.PageQuery) domain.Page[domai
 }
 
 // CreateRun 创建执行记录。
-func (s *Store) CreateRun(r *domain.TaskRun) error {
+func (s *MemStore) CreateRun(r *domain.TaskRun) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *r
@@ -889,7 +894,7 @@ func (s *Store) CreateRun(r *domain.TaskRun) error {
 }
 
 // UpdateRun 更新执行记录（写入最新的任务上下文快照）。
-func (s *Store) UpdateRun(r *domain.TaskRun) error {
+func (s *MemStore) UpdateRun(r *domain.TaskRun) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.runs[r.ID]; !ok {
@@ -909,7 +914,7 @@ func (s *Store) UpdateRun(r *domain.TaskRun) error {
 }
 
 // GetRun 查询执行记录。
-func (s *Store) GetRun(tenantID, id string) (*domain.TaskRun, bool) {
+func (s *MemStore) GetRun(tenantID, id string) (*domain.TaskRun, bool) {
 	if id == "" {
 		return nil, false
 	}
@@ -923,7 +928,7 @@ func (s *Store) GetRun(tenantID, id string) (*domain.TaskRun, bool) {
 }
 
 // GetRunRaw 无租户校验查询（内部调度使用）。
-func (s *Store) GetRunRaw(id string) (*domain.TaskRun, bool) {
+func (s *MemStore) GetRunRaw(id string) (*domain.TaskRun, bool) {
 	if id == "" {
 		return nil, false
 	}
@@ -937,7 +942,7 @@ func (s *Store) GetRunRaw(id string) (*domain.TaskRun, bool) {
 }
 
 // FindRunByIdempotencyKey 幂等键查找未完成/已完成的执行记录。
-func (s *Store) FindRunByIdempotencyKey(tenantID, key string) (*domain.TaskRun, bool) {
+func (s *MemStore) FindRunByIdempotencyKey(tenantID, key string) (*domain.TaskRun, bool) {
 	if key == "" {
 		return nil, false
 	}
@@ -956,7 +961,7 @@ func (s *Store) FindRunByIdempotencyKey(tenantID, key string) (*domain.TaskRun, 
 }
 
 // ListRuns 列出执行记录。
-func (s *Store) ListRuns(tenantID string, q domain.PageQuery) domain.Page[domain.TaskRun] {
+func (s *MemStore) ListRuns(tenantID string, q domain.PageQuery) domain.Page[domain.TaskRun] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	q.Normalize()
@@ -979,7 +984,7 @@ func (s *Store) ListRuns(tenantID string, q domain.PageQuery) domain.Page[domain
 }
 
 // AllRuns 返回某租户全部执行记录（统计用）。
-func (s *Store) AllRuns(tenantID string) []domain.TaskRun {
+func (s *MemStore) AllRuns(tenantID string) []domain.TaskRun {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.TaskRun{}
@@ -991,8 +996,28 @@ func (s *Store) AllRuns(tenantID string) []domain.TaskRun {
 	return out
 }
 
+// ListQueued 列出仍处于排队中的运行（按入队先后）。
+//
+// 用途：进程重启后恢复排队任务、多实例部署时认领待执行任务。
+func (s *MemStore) ListQueued(limit int) []domain.TaskRun {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []domain.TaskRun{}
+	for _, r := range s.runs {
+		if r.State != domain.StateQueued {
+			continue
+		}
+		out = append(out, *cloneRun(r))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
 // CountRunsByState 统计某租户各状态数量。
-func (s *Store) CountRunsByState(tenantID string) map[domain.TaskState]int {
+func (s *MemStore) CountRunsByState(tenantID string) map[domain.TaskState]int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := map[domain.TaskState]int{}
@@ -1009,7 +1034,7 @@ func (s *Store) CountRunsByState(tenantID string) map[domain.TaskState]int {
 // ---------------------------------------------------------------------------
 
 // CreateReport 归档报告。
-func (s *Store) CreateReport(r *domain.Report) error {
+func (s *MemStore) CreateReport(r *domain.Report) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := *r
@@ -1019,7 +1044,7 @@ func (s *Store) CreateReport(r *domain.Report) error {
 }
 
 // GetReport 查询报告。
-func (s *Store) GetReport(tenantID, id string) (*domain.Report, bool) {
+func (s *MemStore) GetReport(tenantID, id string) (*domain.Report, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	r, ok := s.reports[id]
@@ -1031,7 +1056,7 @@ func (s *Store) GetReport(tenantID, id string) (*domain.Report, bool) {
 }
 
 // GetReportByRun 按运行 ID 查询报告。
-func (s *Store) GetReportByRun(tenantID, runID string) (*domain.Report, bool) {
+func (s *MemStore) GetReportByRun(tenantID, runID string) (*domain.Report, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, r := range s.reports {
@@ -1044,7 +1069,7 @@ func (s *Store) GetReportByRun(tenantID, runID string) (*domain.Report, bool) {
 }
 
 // ListReports 列出报告。
-func (s *Store) ListReports(tenantID string, q domain.PageQuery) domain.Page[domain.Report] {
+func (s *MemStore) ListReports(tenantID string, q domain.PageQuery) domain.Page[domain.Report] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	q.Normalize()
@@ -1067,7 +1092,7 @@ func (s *Store) ListReports(tenantID string, q domain.PageQuery) domain.Page[dom
 // ---------------------------------------------------------------------------
 
 // AppendAudit 追加审计事件（内存上限内保留）。
-func (s *Store) AppendAudit(ev domain.AuditEvent) {
+func (s *MemStore) AppendAudit(ev domain.AuditEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.audits = append(s.audits, ev)
@@ -1078,7 +1103,7 @@ func (s *Store) AppendAudit(ev domain.AuditEvent) {
 }
 
 // AppendSkillCall 追加技能调用记录。
-func (s *Store) AppendSkillCall(c domain.SkillCall) {
+func (s *MemStore) AppendSkillCall(c domain.SkillCall) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.skillLog = append(s.skillLog, c)
@@ -1089,7 +1114,7 @@ func (s *Store) AppendSkillCall(c domain.SkillCall) {
 }
 
 // AppendModelCall 追加模型调用记录。
-func (s *Store) AppendModelCall(c domain.ModelCall) {
+func (s *MemStore) AppendModelCall(c domain.ModelCall) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.modelLog = append(s.modelLog, c)
@@ -1100,7 +1125,7 @@ func (s *Store) AppendModelCall(c domain.ModelCall) {
 }
 
 // ListAudits 查询审计事件。
-func (s *Store) ListAudits(tenantID string, q domain.PageQuery) domain.Page[domain.AuditEvent] {
+func (s *MemStore) ListAudits(tenantID string, q domain.PageQuery) domain.Page[domain.AuditEvent] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	q.Normalize()
@@ -1122,7 +1147,7 @@ func (s *Store) ListAudits(tenantID string, q domain.PageQuery) domain.Page[doma
 }
 
 // ListSkillCalls 查询技能调用记录。
-func (s *Store) ListSkillCalls(tenantID, runID string, q domain.PageQuery) domain.Page[domain.SkillCall] {
+func (s *MemStore) ListSkillCalls(tenantID, runID string, q domain.PageQuery) domain.Page[domain.SkillCall] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	q.Normalize()
@@ -1147,7 +1172,7 @@ func (s *Store) ListSkillCalls(tenantID, runID string, q domain.PageQuery) domai
 }
 
 // ListModelCalls 查询模型调用记录。
-func (s *Store) ListModelCalls(tenantID, runID string, q domain.PageQuery) domain.Page[domain.ModelCall] {
+func (s *MemStore) ListModelCalls(tenantID, runID string, q domain.PageQuery) domain.Page[domain.ModelCall] {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	q.Normalize()
@@ -1172,7 +1197,7 @@ func (s *Store) ListModelCalls(tenantID, runID string, q domain.PageQuery) domai
 }
 
 // AllSkillCalls 返回某租户全部技能调用（统计用）。
-func (s *Store) AllSkillCalls(tenantID string) []domain.SkillCall {
+func (s *MemStore) AllSkillCalls(tenantID string) []domain.SkillCall {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.SkillCall{}
@@ -1185,7 +1210,7 @@ func (s *Store) AllSkillCalls(tenantID string) []domain.SkillCall {
 }
 
 // AllModelCalls 返回某租户全部模型调用（统计用）。
-func (s *Store) AllModelCalls(tenantID string) []domain.ModelCall {
+func (s *MemStore) AllModelCalls(tenantID string) []domain.ModelCall {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := []domain.ModelCall{}

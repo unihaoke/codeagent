@@ -11,7 +11,7 @@
  * 说明：状态筛选需要参与请求，这里复用 usePaged 管理分页/关键字，状态作为闭包变量注入 loader，
  * 变更状态时重置到第一页后重新加载。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ApiError, api } from '@/api/client'
 import type { TaskRun, TaskState } from '@/types'
@@ -152,6 +152,65 @@ const pageStats = computed(() => {
 })
 
 const isEmpty = computed(() => !loading.value && runItems.value.length === 0)
+
+/* ------------------------------ 列表自刷新 ------------------------------ */
+
+/**
+ * 全局 WebSocket 只推送连接建立之后的事件：页面打开前或断线期间发生的状态迁移
+ * 永远不会回补，列表会长期停留在 queued（进而出现"点取消却报任务已终态"的矛盾）。
+ * 这里对「本页存在未终态任务」的情况做轻量轮询兜底。
+ */
+const ACTIVE_STATES: TaskState[] = ['queued', 'analyzing', 'repairing', 'verifying']
+const POLL_INTERVAL_MS = 8000
+
+/** 本页是否存在未终态任务：据此开关轮询，避免任务全部结束后仍空转请求。 */
+const hasActive = computed(() =>
+  runItems.value.some((run) => ACTIVE_STATES.includes(runState(run))),
+)
+
+let pollTimer: number | null = null
+/** 轮询触发的刷新标记为 true：避免"加载中"徽标每 8 秒闪烁一次。 */
+const autoRefreshing = ref(false)
+
+function stopPolling(): void {
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+function startPolling(): void {
+  if (pollTimer !== null) return
+  pollTimer = window.setInterval(() => {
+    // 页面不可见时不打扰后端；切回前台由 visibilitychange 立即补一次。
+    if (document.hidden) return
+    autoRefreshing.value = true
+    void load().finally(() => {
+      autoRefreshing.value = false
+    })
+  }, POLL_INTERVAL_MS)
+}
+
+// 出现进行中任务则开启轮询，全部结束后自动停止。
+watch(hasActive, (active) => (active ? startPolling() : stopPolling()))
+// 翻页 / 筛选 / 搜索后若仍有进行中任务，确保轮询处于开启状态。
+watch(runItems, () => {
+  if (hasActive.value) startPolling()
+})
+
+function onVisibility(): void {
+  if (!document.hidden && hasActive.value) void load()
+}
+
+onMounted(() => {
+  if (hasActive.value) startPolling()
+  document.addEventListener('visibilitychange', onVisibility)
+})
+
+onUnmounted(() => {
+  stopPolling()
+  document.removeEventListener('visibilitychange', onVisibility)
+})
 </script>
 
 <template>
@@ -167,7 +226,7 @@ const isEmpty = computed(() => !loading.value && runItems.value.length === 0)
         </div>
       </div>
       <div class="row wrap">
-        <span v-if="loading" class="badge badge-info"><i class="dot pulse" />加载中</span>
+        <span v-if="loading && !autoRefreshing" class="badge badge-info"><i class="dot pulse" />加载中</span>
         <button class="btn btn-sm" :disabled="loading" @click="refresh">刷新</button>
         <button class="btn btn-sm btn-primary" @click="goCreate">发起排查</button>
       </div>

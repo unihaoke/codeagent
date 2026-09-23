@@ -110,7 +110,7 @@ const (
 // Deps 流水线依赖（全部为接口，便于单测注入 fake）。
 type Deps struct {
 	// Store 数据访问层（租户配额、分组视图、报告落库）。
-	Store *store.Store
+	Store store.Store
 	// Cfg 全系统配置。
 	Cfg *config.Config
 	// Source 源码解析与懒加载（版本锁定、文件切片）。
@@ -199,7 +199,12 @@ func (p *Pipeline) audit(ev domain.AuditEvent) {
 // ---------------------------------------------------------------------------
 
 // runCtx 一次流水线执行的内部可变状态，仅在本次 Execute 内使用。
+//
+// 并发约定：可并行阶段（如 resolve 与 stack_parse）会并发调用 warn/degrade/
+// addTimeline，所有共享写入必须持 mu；阶段内部只写自己的局部结果，合并阶段串行执行。
 type runCtx struct {
+	// mu 保护 run/bundle/timeline 的共享写入（并行阶段可能同时降级或写时间线）。
+	mu       sync.Mutex
 	run      *domain.TaskRun
 	bundle   *domain.EvidenceBundle
 	timeline []domain.TimelineItem
@@ -229,6 +234,8 @@ type runCtx struct {
 }
 
 func (rc *runCtx) addTimeline(stage, msg, level string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
 	rc.timeline = append(rc.timeline, domain.TimelineItem{
 		At:      time.Now(),
 		Stage:   stage,
@@ -238,15 +245,37 @@ func (rc *runCtx) addTimeline(stage, msg, level string) {
 }
 
 // warn 追加运行警告并写入时间线（降级而非失败）。
-func (rc *runCtx) warn(msg string) {
+//
+// 串行阶段使用：阶段名取 rc.stage（由 runStage 设置）。
+func (rc *runCtx) warn(msg string) { rc.warnStage(rc.stage, msg) }
+
+// warnStage 指定阶段名追加警告：并行阶段必用（rc.stage 会被其他阶段覆盖）。
+func (rc *runCtx) warnStage(stage, msg string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.warnLocked(stage, msg)
+}
+
+// warnLocked 在已持锁的前提下追加警告（供 degrade 复用，避免重复加锁）。
+func (rc *runCtx) warnLocked(stage, msg string) {
 	rc.run.Warnings = append(rc.run.Warnings, msg)
-	rc.addTimeline(rc.stage, msg, "warn")
+	rc.timeline = append(rc.timeline, domain.TimelineItem{
+		At:      time.Now(),
+		Stage:   stage,
+		Message: msg,
+		Level:   "warn",
+	})
 }
 
 // degrade 标记本次运行降级并记录原因。
-func (rc *runCtx) degrade(msg string) {
+func (rc *runCtx) degrade(msg string) { rc.degradeStage(rc.stage, msg) }
+
+// degradeStage 指定阶段名标记降级：并行阶段必用。
+func (rc *runCtx) degradeStage(stage, msg string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
 	rc.run.Degraded = true
-	rc.warn(msg)
+	rc.warnLocked(stage, msg)
 }
 
 func (rc *runCtx) repoByID(id string) *domain.Repository {
@@ -275,6 +304,126 @@ type stageFunc func(ctx context.Context, cc *domain.CallContext, rc *runCtx) err
 type stageDef struct {
 	name string
 	fn   stageFunc
+}
+
+// stageGroup 一组阶段：parallel 为 true 时组内阶段并发执行。
+type stageGroup struct {
+	parallel bool
+	stages   []stageDef
+}
+
+// stageGroups 返回按数据依赖切分的阶段组。
+//
+// 依赖分析（决定哪些阶段能并行）：
+//   - resolve（版本锁定：git IO）与 stack_parse（堆栈解析：技能/模型 IO）是单次运行中
+//     最耗时的两个 IO 阶段，且互不依赖（堆栈解析只读 run.Stacktrace/Logs），可并行；
+//   - candidates 依赖 resolve 产出的仓库索引与 stack_parse 产出的堆栈分析结果；
+//   - code_load 依赖候选仓库与锁定 commit，root_cause 依赖代码切片，
+//     patch_synthesize 依赖根因，sandbox_verify 依赖补丁，report/archive 依赖全部产物。
+//
+// 因此只有第一组可并行，其余阶段存在严格顺序依赖，保持串行以免破坏"降级不失败"语义。
+func (p *Pipeline) stageGroups() []stageGroup {
+	return []stageGroup{
+		{parallel: true, stages: []stageDef{
+			{StageResolve, p.stageResolve},
+			{StageStackParse, p.stageStackParse},
+		}},
+		{stages: []stageDef{{StageCandidates, p.stageCandidates}}},
+		{stages: []stageDef{{StageCodeLoad, p.stageCodeLoad}}},
+		{stages: []stageDef{{StageRootCause, p.stageRootCause}}},
+		{stages: []stageDef{{StagePatchSynthesize, p.stagePatchSynthesize}}},
+		{stages: []stageDef{{StageSandboxVerify, p.stageSandboxVerify}}},
+		{stages: []stageDef{{StageReport, p.stageReport}}},
+		{stages: []stageDef{{StageArchive, p.stageArchive}}},
+	}
+}
+
+// runGroup 执行一个阶段组，返回 (是否中止, 错误)。
+//
+// 并行组的开始事件按声明顺序先行发布：阶段进度只前进不后退，
+// 否则前端进度条会因完成顺序不同而来回跳变。
+func (p *Pipeline) runGroup(ctx context.Context, cc *domain.CallContext, rc *runCtx, g stageGroup) (bool, error) {
+	if !g.parallel || len(g.stages) <= 1 {
+		return p.runSerial(ctx, cc, rc, g.stages)
+	}
+
+	// 1) 按声明顺序发布开始事件（含状态机阶段回调），保证阶段进度单调。
+	for _, st := range g.stages {
+		if rc.skipStage(st.name) {
+			continue
+		}
+		p.notifyStage(rc.run.ID, st.name)
+		p.stageEvent(rc, st.name, "start", fmt.Sprintf("阶段 %s 开始", stageTitle(st.name)), "info", nil)
+		p.audit(domain.AuditEvent{
+			TenantID: rc.run.TenantID, RunID: rc.run.ID, TaskID: rc.run.TaskID,
+			Category: "stage", Action: st.name, Level: "info",
+			Message: fmt.Sprintf("阶段 %s 开始（并行）", stageTitle(st.name)),
+			Data:    map[string]any{"phase": "start", "parallel": true},
+		})
+	}
+
+	// 2) 并发执行：每个 goroutine 只写自己的槽位，共享写入走 rc 的加锁方法。
+	//
+	// rc.stage 是共享字段（技能调用轨迹、时间线阶段名都取它），并发写会相互覆盖：
+	// 由主线程执行最后一个声明的阶段（当前为 stack_parse，技能轨迹需要它），
+	// 其余阶段在 goroutine 中并发，且这些阶段一律用 warnStage/degradeStage 显式指定阶段名。
+	runs := make([]stageRun, len(g.stages))
+	executed := make([]bool, len(g.stages))
+	mainIdx := len(g.stages) - 1
+	var wg sync.WaitGroup
+	for i := range g.stages {
+		st := g.stages[i]
+		if rc.skipStage(st.name) || i == mainIdx {
+			continue
+		}
+		executed[i] = true
+		wg.Add(1)
+		go func(idx int, def stageDef) {
+			defer wg.Done()
+			runs[idx] = p.execStage(ctx, cc, rc, def.name, def.fn, false)
+		}(i, st)
+	}
+	if !rc.skipStage(g.stages[mainIdx].name) {
+		executed[mainIdx] = true
+		rc.stage = g.stages[mainIdx].name // 主线程独占，安全
+		runs[mainIdx] = p.execStage(ctx, cc, rc, g.stages[mainIdx].name, g.stages[mainIdx].fn, false)
+	}
+	wg.Wait()
+
+	// 3) 结束事件按声明顺序发布：阶段进度单调前进，不因完成先后而回退。
+	for i := range g.stages {
+		if executed[i] {
+			p.emitStageEnd(rc, runs[i])
+		}
+	}
+
+	// 4) 按声明顺序上报首个错误，保证失败归因稳定（不因调度顺序而变）。
+	for i, st := range g.stages {
+		if !executed[i] || runs[i].err == nil {
+			continue
+		}
+		rc.run.Error = runs[i].err.Error()
+		rc.addTimeline(st.name, "阶段执行失败："+runs[i].err.Error(), "error")
+		return true, runs[i].err
+	}
+	return false, nil
+}
+
+// runSerial 顺序执行一组阶段。
+func (p *Pipeline) runSerial(ctx context.Context, cc *domain.CallContext, rc *runCtx, stages []stageDef) (bool, error) {
+	for _, st := range stages {
+		if rc.skipStage(st.name) {
+			rc.addTimeline(st.name, "本轮已降级为堆栈文本分析，跳过阶段 "+st.name, "warn")
+			continue
+		}
+		if err := p.runStage(ctx, cc, rc, st.name, st.fn); err != nil {
+			// 致命异常：交由 Engine 判定为 failed（上下文取消则判定为 cancelled）。
+			rc.run.Error = err.Error()
+			rc.addTimeline(st.name, "阶段执行失败："+err.Error(), "error")
+			return true, err
+		}
+	}
+	return false, nil
 }
 
 // Execute 执行完整流水线：证据准备 → 分析 → 修复 → 验证 → 报告 → 归档。
@@ -311,27 +460,10 @@ func (p *Pipeline) Execute(ctx context.Context, cc *domain.CallContext, run *dom
 	}
 	rc.lastFeedback = ExtractHumanFeedback(run)
 
-	stages := []stageDef{
-		{StageResolve, p.stageResolve},
-		{StageStackParse, p.stageStackParse},
-		{StageCandidates, p.stageCandidates},
-		{StageCodeLoad, p.stageCodeLoad},
-		{StageRootCause, p.stageRootCause},
-		{StagePatchSynthesize, p.stagePatchSynthesize},
-		{StageSandboxVerify, p.stageSandboxVerify},
-		{StageReport, p.stageReport},
-		{StageArchive, p.stageArchive},
-	}
-
-	for _, st := range stages {
-		if rc.skipStage(st.name) {
-			rc.addTimeline(st.name, "本轮已降级为堆栈文本分析，跳过阶段 "+st.name, "warn")
-			continue
-		}
-		if err := p.runStage(ctx, cc, rc, st.name, st.fn); err != nil {
+	// 按阶段组推进：组内可并行（如 resolve 与 stack_parse），组间保持依赖顺序。
+	for _, g := range p.stageGroups() {
+		if _, err := p.runGroup(ctx, cc, rc, g); err != nil {
 			// 致命异常：交由 Engine 判定为 failed（上下文取消则判定为 cancelled）。
-			rc.run.Error = err.Error()
-			rc.addTimeline(st.name, "阶段执行失败："+err.Error(), "error")
 			return p.buildResult(rc), err
 		}
 	}
@@ -370,19 +502,43 @@ func (rc *runCtx) skipStage(name string) bool {
 	}
 }
 
+// stageRun 一次阶段执行的结果（结束事件可延迟发布，见 runGroup）。
+type stageRun struct {
+	name  string
+	err   error
+	cost  time.Duration
+	level string
+	msg   string
+}
+
 // runStage 包裹单个阶段：开始/结束埋点 + 事件 + 时间线 + 状态机回调。
 func (p *Pipeline) runStage(ctx context.Context, cc *domain.CallContext, rc *runCtx, name string, fn stageFunc) error {
 	rc.stage = name
+	r := p.execStage(ctx, cc, rc, name, fn, true)
+	p.emitStageEnd(rc, r)
+	return r.err
+}
+
+// execStage 执行阶段主体；announce=false 用于并行组（开始事件已由 runGroup 统一发布）。
+//
+// 注意：并行组不设置 rc.stage（否则并发写会互相覆盖），阶段内部的降级/警告
+// 必须使用 rc.warnStage/degradeStage 显式指定阶段名。
+func (p *Pipeline) execStage(ctx context.Context, cc *domain.CallContext, rc *runCtx, name string, fn stageFunc, announce bool) stageRun {
+	if announce {
+		rc.stage = name
+	}
 	start := time.Now()
 
-	p.notifyStage(rc.run.ID, name)
-	p.stageEvent(rc, name, "start", fmt.Sprintf("阶段 %s 开始", stageTitle(name)), "info", nil)
-	p.audit(domain.AuditEvent{
-		TenantID: rc.run.TenantID, RunID: rc.run.ID, TaskID: rc.run.TaskID,
-		Category: "stage", Action: name, Level: "info",
-		Message: fmt.Sprintf("阶段 %s 开始", stageTitle(name)),
-		Data:    map[string]any{"phase": "start"},
-	})
+	if announce {
+		p.notifyStage(rc.run.ID, name)
+		p.stageEvent(rc, name, "start", fmt.Sprintf("阶段 %s 开始", stageTitle(name)), "info", nil)
+		p.audit(domain.AuditEvent{
+			TenantID: rc.run.TenantID, RunID: rc.run.ID, TaskID: rc.run.TaskID,
+			Category: "stage", Action: name, Level: "info",
+			Message: fmt.Sprintf("阶段 %s 开始", stageTitle(name)),
+			Data:    map[string]any{"phase": "start"},
+		})
+	}
 
 	err := fn(ctx, cc, rc)
 	cost := time.Since(start)
@@ -392,13 +548,19 @@ func (p *Pipeline) runStage(ctx context.Context, cc *domain.CallContext, rc *run
 		level, msg = "error", fmt.Sprintf("阶段 %s 失败：%v", stageTitle(name), err)
 	}
 	rc.addTimeline(name, msg, level)
-	p.stageEvent(rc, name, "end", msg, level, map[string]any{"durationMs": cost.Milliseconds()})
+	// 结束事件交由调用方发布：并行组需要等全部阶段结束后按声明顺序发布，
+	// 否则前端进度条会因完成顺序不同而来回跳变。
+	return stageRun{name: name, err: err, cost: cost, level: level, msg: msg}
+}
+
+// emitStageEnd 发布阶段结束事件与审计。
+func (p *Pipeline) emitStageEnd(rc *runCtx, r stageRun) {
+	p.stageEvent(rc, r.name, "end", r.msg, r.level, map[string]any{"durationMs": r.cost.Milliseconds()})
 	p.audit(domain.AuditEvent{
 		TenantID: rc.run.TenantID, RunID: rc.run.ID, TaskID: rc.run.TaskID,
-		Category: "stage", Action: name, Level: level, Message: msg,
-		Data: map[string]any{"phase": "end", "durationMs": cost.Milliseconds()},
+		Category: "stage", Action: r.name, Level: r.level, Message: r.msg,
+		Data: map[string]any{"phase": "end", "durationMs": r.cost.Milliseconds()},
 	})
-	return err
 }
 
 func (p *Pipeline) stageEvent(rc *runCtx, stage, phase, msg, level string, extra map[string]any) {
@@ -457,76 +619,131 @@ func (p *Pipeline) stageResolve(ctx context.Context, cc *domain.CallContext, rc 
 	p.indexRepos(rc)
 
 	if len(rc.reposByID) == 0 {
-		rc.degrade("没有可锁定的目标仓库，无法获取代码证据")
+		rc.degradeStage(StageResolve, "没有可锁定的目标仓库，无法获取代码证据")
 		return nil
 	}
 
 	targets := p.resolveTargets(rc)
 	if len(targets) == 0 {
-		rc.degrade("目标仓库为空，跳过版本锁定")
+		rc.degradeStage(StageResolve, "目标仓库为空，跳过版本锁定")
 		return nil
 	}
 	if p.d.Source == nil {
-		rc.degrade("源码解析器不可用，无法锁定代码版本")
+		rc.degradeStage(StageResolve, "源码解析器不可用，无法锁定代码版本")
 		return nil
 	}
 	if run.PinnedCommits == nil {
 		run.PinnedCommits = map[string]string{}
 	}
 
-	for _, repo := range targets {
-		if c := run.PinnedCommits[repo.ID]; c != "" {
-			// 多轮修复：复用已固化的 commit，保证同一份代码（CONTRACT §6.8）。
-			rc.lockedRepos = append(rc.lockedRepos, repo)
-			rc.addTimeline(StageResolve, fmt.Sprintf("复用已固化版本：%s @ %s", repo.Key, shortCommit(c)), "info")
-			run.Resolution = appendResolution(run.Resolution, domain.RepoResolved{
+	// 并发锁定：每个仓库的版本解析是彼此独立的 IO（git fetch / rev-parse），
+	// 串行执行会让分组模式（多入口仓库）的阶段耗时线性叠加。
+	outcomes := make([]resolveOutcome, len(targets))
+	var wg sync.WaitGroup
+	for i, repo := range targets {
+		wg.Add(1)
+		go func(idx int, r *domain.Repository) {
+			defer wg.Done()
+			outcomes[idx] = p.resolveOne(ctx, rc, r)
+		}(i, repo)
+	}
+	wg.Wait()
+
+	// 按 target 声明顺序串行合并：时间线与 Resolution 顺序不受完成先后影响，
+	// 保证同一次运行的产物可复现、可对照。
+	for i := range outcomes {
+		p.applyResolve(rc, outcomes[i])
+	}
+	return nil
+}
+
+// resolveOutcome 单个仓库的版本锁定结果。
+//
+// 并发阶段只写自己的结果槽位，不触碰 runCtx / run 的共享字段。
+type resolveOutcome struct {
+	repo   *domain.Repository
+	commit string
+	// reused 复用已固化 commit（多轮修复），无需再解析。
+	reused bool
+	res    *domain.RepoResolved
+	err    error
+}
+
+// resolveOne 解析单个仓库的锁定 commit（并发安全：只读 rc/run）。
+func (p *Pipeline) resolveOne(ctx context.Context, rc *runCtx, repo *domain.Repository) resolveOutcome {
+	run := rc.run
+	if c := run.PinnedCommits[repo.ID]; c != "" {
+		// 多轮修复：复用已固化的 commit，保证同一份代码（CONTRACT §6.8）。
+		return resolveOutcome{
+			repo: repo, commit: c, reused: true,
+			res: &domain.RepoResolved{
 				RepositoryID: repo.ID, RepoKey: repo.Key, Name: repo.Name, Layer: repo.Layer,
 				Commit: c, RequestedRef: run.RequestedRef, ResolvedFrom: resolveFrom(rc, run),
 				ResolvedAt: time.Now(),
-			})
-			continue
+			},
 		}
-
-		ref := p.repoRef(repo, run, rc)
-		commit, err := p.d.Source.Resolve(ctx, ref)
-		if err != nil {
-			// 单仓库/入口仓库解析失败：记录警告并降级，后续阶段在无代码证据下继续。
-			rc.degrade(fmt.Sprintf("仓库 %s 版本锁定失败（%v），本次分析将在无代码证据下继续", repo.Key, err))
-			rc.bundle.Notes = append(rc.bundle.Notes, fmt.Sprintf("仓库 %s 版本锁定失败：%v", repo.Key, err))
-			continue
-		}
-		if commit == "" {
-			rc.degrade(fmt.Sprintf("仓库 %s 未解析出可用 commit，本次分析将在无代码证据下继续", repo.Key))
-			continue
-		}
-
-		run.PinnedCommits[repo.ID] = commit
-		rc.lockedRepos = append(rc.lockedRepos, repo)
-		res := domain.RepoResolved{
+	}
+	ref := p.repoRef(repo, run, rc)
+	commit, err := p.d.Source.Resolve(ctx, ref)
+	if err != nil {
+		return resolveOutcome{repo: repo, err: err}
+	}
+	if commit == "" {
+		return resolveOutcome{repo: repo}
+	}
+	return resolveOutcome{
+		repo: repo, commit: commit,
+		res: &domain.RepoResolved{
 			RepositoryID: repo.ID, RepoKey: repo.Key, Name: repo.Name, Layer: repo.Layer,
 			Commit: commit, RequestedRef: run.RequestedRef,
 			ResolvedFrom: resolveFrom(rc, run), ResolvedAt: time.Now(),
-		}
-		run.Resolution = appendResolution(run.Resolution, res)
-
-		msg := fmt.Sprintf("仓库 %s 版本锁定成功：%s", repo.Key, shortCommit(commit))
-		rc.addTimeline(StageResolve, msg, "info")
-		p.audit(domain.AuditEvent{
-			TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
-			Category: "repo", Action: "repo.switch", Level: "info", Message: msg,
-			RepoID: repo.ID, Commit: commit, Data: res,
-		})
-		p.publish(domain.Event{
-			Type: "repo.switch", TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
-			Stage: StageResolve, Message: msg, Payload: res,
-		})
-		p.publish(domain.Event{
-			Type: "source.fetch", TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
-			Stage: StageResolve, Message: msg,
-			Payload: map[string]any{"repositoryId": repo.ID, "repoKey": repo.Key, "commit": commit, "action": "resolve"},
-		})
+		},
 	}
-	return nil
+}
+
+// applyResolve 把一个仓库的锁定结果并入运行上下文（串行调用）。
+func (p *Pipeline) applyResolve(rc *runCtx, o resolveOutcome) {
+	run := rc.run
+	if o.repo == nil {
+		return
+	}
+	if o.err != nil {
+		// 单仓库/入口仓库解析失败：记录警告并降级，后续阶段在无代码证据下继续。
+		rc.degradeStage(StageResolve, fmt.Sprintf("仓库 %s 版本锁定失败（%v），本次分析将在无代码证据下继续", o.repo.Key, o.err))
+		rc.bundle.Notes = append(rc.bundle.Notes, fmt.Sprintf("仓库 %s 版本锁定失败：%v", o.repo.Key, o.err))
+		return
+	}
+	if o.commit == "" {
+		rc.degradeStage(StageResolve, fmt.Sprintf("仓库 %s 未解析出可用 commit，本次分析将在无代码证据下继续", o.repo.Key))
+		return
+	}
+	if o.reused {
+		rc.lockedRepos = append(rc.lockedRepos, o.repo)
+		rc.addTimeline(StageResolve, fmt.Sprintf("复用已固化版本：%s @ %s", o.repo.Key, shortCommit(o.commit)), "info")
+		run.Resolution = appendResolution(run.Resolution, *o.res)
+		return
+	}
+
+	run.PinnedCommits[o.repo.ID] = o.commit
+	rc.lockedRepos = append(rc.lockedRepos, o.repo)
+	run.Resolution = appendResolution(run.Resolution, *o.res)
+
+	msg := fmt.Sprintf("仓库 %s 版本锁定成功：%s", o.repo.Key, shortCommit(o.commit))
+	rc.addTimeline(StageResolve, msg, "info")
+	p.audit(domain.AuditEvent{
+		TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
+		Category: "repo", Action: "repo.switch", Level: "info", Message: msg,
+		RepoID: o.repo.ID, Commit: o.commit, Data: *o.res,
+	})
+	p.publish(domain.Event{
+		Type: "repo.switch", TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
+		Stage: StageResolve, Message: msg, Payload: *o.res,
+	})
+	p.publish(domain.Event{
+		Type: "source.fetch", TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
+		Stage: StageResolve, Message: msg,
+		Payload: map[string]any{"repositoryId": o.repo.ID, "repoKey": o.repo.Key, "commit": o.commit, "action": "resolve"},
+	})
 }
 
 // resolveTargets 返回需要在本阶段解析锁定的仓库。
@@ -708,7 +925,7 @@ func (p *Pipeline) stageStackParse(ctx context.Context, cc *domain.CallContext, 
 	sa := p.parseStacktrace(ctx, cc, rc)
 	if sa == nil || (sa.ExceptionType == "" && len(sa.Frames) == 0 && sa.CleanedLog == "") {
 		sa = localStackAnalysis(run)
-		rc.warn("堆栈解析技能输出为空，已降级为本地规则解析（仅提取异常类型与日志）")
+		rc.warnStage(StageStackParse, "堆栈解析技能输出为空，已降级为本地规则解析（仅提取异常类型与日志）")
 	}
 	if sa.CleanedLog == "" {
 		sa.CleanedLog = strings.TrimSpace(run.Stacktrace)
@@ -738,11 +955,11 @@ func (p *Pipeline) parseStacktrace(ctx context.Context, cc *domain.CallContext, 
 		if err != nil {
 			reason = err.Error()
 		}
-		rc.warn("堆栈解析技能不可用（" + reason + "），已启用本地兜底解析")
+		rc.warnStage(StageStackParse, "堆栈解析技能不可用（"+reason+"），已启用本地兜底解析")
 		return nil
 	}
 	if res.Status != "" && res.Status != domain.CallOK && res.Status != domain.CallFallback {
-		rc.warn("堆栈解析技能返回状态 " + string(res.Status) + "，已启用本地兜底解析")
+		rc.warnStage(StageStackParse, "堆栈解析技能返回状态 "+string(res.Status)+"，已启用本地兜底解析")
 		return nil
 	}
 

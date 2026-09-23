@@ -222,7 +222,9 @@ type TaskRun struct {
 	ID       string    `json:"id"`
 	TaskID   string    `json:"taskId"`
 	TenantID string    `json:"tenantId"`
-	Attempt  int       `json:"attempt"`
+	Attempt int `json:"attempt"`
+	// Priority 提交时指定的调度优先级（越大越优先），用于出队排序；未指定时按入队先后。
+	Priority int       `json:"priority,omitempty"`
 	Mode     TaskMode  `json:"mode"`
 	State    TaskState `json:"state"`
 	Severity Severity  `json:"severity,omitempty"`

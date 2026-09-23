@@ -82,7 +82,7 @@ const recentFailureLimit = 5
 
 // Recorder 审计与可观测记录器。
 type Recorder struct {
-	st  *store.Store
+	st  store.Store
 	bus domain.EventBus
 }
 
@@ -90,12 +90,12 @@ type Recorder struct {
 var _ domain.Recorder = (*Recorder)(nil)
 
 // New 创建记录器；bus 允许为 nil（仅落库、不广播）。
-func New(st *store.Store, bus domain.EventBus) *Recorder {
+func New(st store.Store, bus domain.EventBus) *Recorder {
 	return &Recorder{st: st, bus: bus}
 }
 
 // Store 返回底层存储（便于上层只读查询）。
-func (r *Recorder) Store() *store.Store {
+func (r *Recorder) Store() store.Store {
 	if r == nil {
 		return nil
 	}

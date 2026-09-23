@@ -389,7 +389,7 @@ func javaContent() string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func newTestStore(t *testing.T, repos ...*domain.Repository) *store.Store {
+func newTestStore(t *testing.T, repos ...*domain.Repository) store.Store {
 	t.Helper()
 	st := store.New()
 	if err := st.CreateTenant(&domain.Tenant{
@@ -474,7 +474,7 @@ func patchDescOutput(oldSnippet, newSnippet string) map[string]any {
 	}
 }
 
-func newPipelineDeps(st *store.Store, cfg *config.Config, src domain.SourceResolver, sk domain.SkillRunner,
+func newPipelineDeps(st store.Store, cfg *config.Config, src domain.SourceResolver, sk domain.SkillRunner,
 	mcp domain.MCPGateway, sb domain.SandboxManager, packer domain.ContextPacker,
 	bus domain.EventBus, rec domain.Recorder) Deps {
 	return Deps{Store: st, Cfg: cfg, Source: src, Skills: sk, MCP: mcp, Sandbox: sb,

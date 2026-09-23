@@ -33,7 +33,7 @@ func newTestBox(t *testing.T) *AESCredentialBox {
 }
 
 // newTestAuth 创建认证中心与空存储。
-func newTestAuth(t *testing.T) (*Auth, *store.Store) {
+func newTestAuth(t *testing.T) (*Auth, store.Store) {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Auth.JWTSecret = "unit-test-jwt-secret"
@@ -45,7 +45,7 @@ func newTestAuth(t *testing.T) (*Auth, *store.Store) {
 }
 
 // seedTenant 写入一个活跃租户。
-func seedTenant(t *testing.T, st *store.Store, id, name string) {
+func seedTenant(t *testing.T, st store.Store, id, name string) {
 	t.Helper()
 	now := time.Now()
 	err := st.CreateTenant(&domain.Tenant{
@@ -58,7 +58,7 @@ func seedTenant(t *testing.T, st *store.Store, id, name string) {
 }
 
 // seedRepo 写入一个仓库。
-func seedRepo(t *testing.T, st *store.Store, id, tenantID, key string) {
+func seedRepo(t *testing.T, st store.Store, id, tenantID, key string) {
 	t.Helper()
 	now := time.Now()
 	err := st.CreateRepo(&domain.Repository{

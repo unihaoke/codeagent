@@ -288,7 +288,7 @@ func (r *fakeRecorder) Observability(_ context.Context, _ string) (*domain.Obser
 
 // fixture 聚合一次测试所需的全部 fake 与真实内存组件。
 type fixture struct {
-	st     *store.Store
+	st     store.Store
 	auth   *fakeAuth
 	engine *fakeEngine
 	skills *fakeSkills

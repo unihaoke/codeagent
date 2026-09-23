@@ -8,7 +8,7 @@ import (
 	"github.com/codeagent/backend/internal/domain"
 )
 
-func newTestStore(t *testing.T) *Store {
+func newTestStore(t *testing.T) Store {
 	t.Helper()
 	return New()
 }

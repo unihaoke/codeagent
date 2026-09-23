@@ -50,7 +50,7 @@ import (
 type harness struct {
 	t       *testing.T
 	srv     *httptest.Server
-	store   *store.Store
+	store   store.Store
 	auth    *env.Auth
 	engine  domain.TaskEngine
 	apiKey  string

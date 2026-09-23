@@ -105,11 +105,18 @@ func run() error {
 	// ---------------------------------------------------------------------
 	// 数据访问层
 	// ---------------------------------------------------------------------
-	var st *store.Store
+	var st store.Store
 	switch strings.ToLower(cfg.Store.Driver) {
 	case "memory":
 		st = store.New()
 		log.Info("数据存储：内存模式（进程退出即丢失）")
+	case "sql":
+		// 共享存储：多实例共享同一份数据，配合排队任务认领实现水平扩展。
+		st, err = store.OpenSQL(cfg.Store.SQLDriver, cfg.Store.DSN, cfg.Store.SQLDialect)
+		if err != nil {
+			return fmt.Errorf("打开共享存储失败: %w", err)
+		}
+		log.Info("数据存储：共享存储模式（支持多实例）", "driver", cfg.Store.SQLDriver)
 	default:
 		interval := time.Duration(cfg.Store.SnapshotIntervalSec) * time.Second
 		st, err = store.OpenFile(cfg.Store.DataFile, interval)
@@ -282,7 +289,7 @@ func run() error {
 //
 // 安全要点：密钥只在此处解密并直接交给 git 调用，不进入日志、不进入任务上下文。
 type secretProvider struct {
-	st  *store.Store
+	st  store.Store
 	box domain.CredentialBox
 }
 

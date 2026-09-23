@@ -18,7 +18,7 @@ import (
 
 // secretProvider 把凭证加密箱适配为 source.SecretProvider。
 type secretProvider struct {
-	st  *store.Store
+	st  store.Store
 	box domain.CredentialBox
 }
 
