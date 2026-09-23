@@ -7,7 +7,7 @@
  */
 import { onMounted, reactive, ref } from 'vue'
 import { ApiError, api } from '@/api/client'
-import type { APIKey, Credential, CredentialType, Tenant, TenantQuota, TenantStatus } from '@/types'
+import type { APIKey, ApiKeyCreateBody, ApiKeyCreateResult, Credential, CredentialType, Tenant, TenantQuota, TenantStatus } from '@/types'
 import { downloadText, formatCompact, formatNumber, formatRelative, formatTime } from '@/utils/format'
 import { toastOk } from '@/composables/useToast'
 import { useAuthStore } from '@/stores/auth'
@@ -247,13 +247,15 @@ const TTL_OPTIONS: { value: number; label: string }[] = [
 const keyOpen = ref(false)
 const keySaving = ref(false)
 const keyError = ref('')
-const keyForm = reactive({ name: '', scopes: ['task:write'] as string[], ttlHours: 720 })
-const createdKey = ref<{ plainKey: string; apiKey: APIKey } | null>(null)
+const keyForm = reactive({ name: '', scopes: ['task:write'] as string[], ttlHours: 720, callbackEnabled: false, callbackHosts: '' })
+const createdKey = ref<ApiKeyCreateResult | null>(null)
 
 function openKeyModal(): void {
   keyForm.name = ''
   keyForm.scopes = ['task:write']
   keyForm.ttlHours = 720
+  keyForm.callbackEnabled = false
+  keyForm.callbackHosts = ''
   keyError.value = ''
   createdKey.value = null
   keyOpen.value = true
@@ -271,9 +273,13 @@ async function submitKey(): Promise<void> {
   keySaving.value = true
   keyError.value = ''
   try {
-    const body: { name: string; scopes: string[]; ttlHours?: number } = {
+    const body: ApiKeyCreateBody = {
       name: keyForm.name.trim(),
       scopes: [...keyForm.scopes],
+      callbackEnabled: keyForm.callbackEnabled,
+      callbackHosts: keyForm.callbackHosts
+        ? keyForm.callbackHosts.split(',').map((s: string) => s.trim()).filter(Boolean)
+        : [],
     }
     if (keyForm.ttlHours > 0) body.ttlHours = keyForm.ttlHours
     const res = await api.createAPIKey(body)
@@ -594,6 +600,7 @@ onMounted(() => {
               <td class="small nowrap">{{ k.expiresAt ? formatTime(k.expiresAt) : '永久有效' }}</td>
               <td>
                 <StatusBadge :label="keyStatus(k).label" :tone="keyStatus(k).tone" />
+                <span v-if="k.callbackEnabled" class="badge bg-info-soft text-info me-1">回调·HMAC</span>
               </td>
               <td style="text-align: right">
                 <button class="btn btn-sm btn-danger" :disabled="k.revoked" @click="askRevoke(k)">
@@ -766,6 +773,23 @@ onMounted(() => {
           </select>
           <span class="field-hint">到期后密钥自动失效，永久有效仅建议用于本地联调。</span>
         </div>
+
+        <div class="field" style="margin-top: 12px">
+          <label class="field-label">回调签名鉴权</label>
+          <label class="scope-item">
+            <input type="checkbox" v-model="keyForm.callbackEnabled" />
+            <span>启用后，该密钥触发的任务终态回调将以 HMAC-SHA256 签名发送（请求头 <code>X-Callback-Signature</code>）</span>
+          </label>
+          <input
+            v-if="keyForm.callbackEnabled"
+            v-model="keyForm.callbackHosts"
+            class="input mono"
+            style="margin-top: 8px"
+            placeholder="允许回调 Host 白名单，逗号分隔，如 hook.svc.com,*.inner.net"
+          />
+          <span v-if="keyForm.callbackEnabled" class="field-hint">留空表示不限制 Host（仅做内网/保留地址段 SSRF 防护）；建议显式填写对端域名。</span>
+        </div>
+
         <div v-if="keyError" class="alert alert-error" style="margin-top: 12px">{{ keyError }}</div>
       </template>
 
@@ -780,6 +804,19 @@ onMounted(() => {
             <CopyButton :text="createdKey.plainKey" label="复制" title="复制明文 Key" />
           </div>
         </div>
+
+        <div v-if="createdKey.callbackSecret" class="field" style="margin-bottom: 12px">
+          <label class="field-label text-warn">回调签名密钥（仅此一次）</label>
+          <p class="text-warn small" style="margin: 0 0 6px">
+            请将此密钥配置到对端服务的回调令牌校验处；本服务后续回调用 HMAC-SHA256 以请求头
+            <code>X-Callback-Signature</code> 签名，服务端只保存密文、不保存明文。
+          </p>
+          <div class="row" style="gap: 8px; align-items: stretch">
+            <code class="code mono" style="flex: 1; padding: 12px">{{ createdKey.callbackSecret }}</code>
+            <CopyButton :text="createdKey.callbackSecret" label="复制" title="复制回调签名密钥" />
+          </div>
+        </div>
+
         <dl class="kv">
           <dt>名称</dt>
           <dd>{{ createdKey.apiKey?.name ?? keyForm.name }}</dd>
@@ -789,6 +826,12 @@ onMounted(() => {
           <dd>{{ (createdKey.apiKey?.scopes ?? keyForm.scopes).join(', ') }}</dd>
           <dt>过期时间</dt>
           <dd>{{ createdKey.apiKey?.expiresAt ? formatTime(createdKey.apiKey.expiresAt) : '永久有效' }}</dd>
+          <dt>回调鉴权</dt>
+          <dd>{{ createdKey.apiKey?.callbackEnabled ? '已启用 · HMAC-SHA256' : '未启用' }}</dd>
+          <template v-if="createdKey.apiKey?.callbackEnabled && createdKey.apiKey?.callbackHosts?.length">
+            <dt>允许回调 Host</dt>
+            <dd><code v-for="h in createdKey.apiKey.callbackHosts" :key="h" class="me-1">{{ h }}</code></dd>
+          </template>
         </dl>
       </template>
 

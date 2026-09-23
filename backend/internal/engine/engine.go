@@ -3,13 +3,17 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -299,6 +303,10 @@ func (e *Engine) Submit(ctx context.Context, sub *domain.Subject, req domain.Cre
 		e.audit(domain.AuditEvent{TenantID: tenantID, Category: "auth", Action: "tenant.mismatch", Level: "warn",
 			Message: msg, RequestID: req.RequestID})
 	}
+	// 记录发起任务的接入密钥，供终态回调选择对应签名密钥（方案2：密钥与密钥/服务绑定）。
+	if sub != nil {
+		req.CallerAPIKeyID = strings.TrimSpace(sub.APIKeyID)
+	}
 	req.TenantID = tenantID
 	return e.submit(ctx, tenantID, req, submitOpts{})
 }
@@ -406,7 +414,8 @@ func (e *Engine) submit(ctx context.Context, tenantID string, req domain.CreateT
 		RequestedRef: req.Ref, RepoIDs: append([]string{}, repoIDs...),
 		EntryFiles:     append([]string{}, req.EntryFiles...),
 		IdempotencyKey: key, RequestID: firstNonEmpty(opts.requestID, req.RequestID),
-		CallbackURL: req.CallbackURL,
+		CallbackURL:    req.CallbackURL,
+		CallerAPIKeyID: req.CallerAPIKeyID,
 		CreatedAt:   now, UpdatedAt: now,
 	}
 	if opts.base != nil {
@@ -1152,11 +1161,33 @@ func (e *Engine) fireCallback(run *domain.TaskRun, report *domain.Report) {
 			e.log.Warn("终态回调报文序列化失败", "run", run.ID, "err", err)
 			return
 		}
+		// 回调签名（方案2，加固版）：签名串 = 时间戳 + "." + 原始报文，覆盖 body 与
+		// 时间戳，可同时防篡改与防重放（对端校验时间戳窗口后重算比对）；结果以
+		// URL-safe Base64（无填充）置于请求头。同时做 SSRF 防护（拒绝内网/保留地址）。
+		headers := map[string]string{}
+		if sig, ok := e.callbackSigningSecret(run); ok {
+			if !callbackHostAllowed(run.CallbackURL, sig.hosts) {
+				e.log.Warn("终态回调被拒：目标 host 未授权或属内网保留地址", "run", run.ID, "url", run.CallbackURL)
+				e.audit(domain.AuditEvent{TenantID: run.TenantID, RunID: run.ID, TaskID: run.TaskID,
+					Category: "task", Action: "callback.skipped", Level: "warn",
+					Message: "回调目标 host 未授权（SSRF 防护），已跳过签名回调"})
+				return
+			}
+			ts := strconv.FormatInt(time.Now().Unix(), 10)
+			mac := hmac.New(sha256.New, []byte(sig.secret))
+			mac.Write([]byte(ts))
+			mac.Write([]byte("."))
+			mac.Write(body)
+			sigB64 := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+			headers["X-Callback-Signature"] = "sha256=" + sigB64
+			headers["X-Callback-Key-Id"] = sig.keyID
+			headers["X-Callback-Timestamp"] = ts
+		}
 		// 指数退避重试：最多 3 次（1s/2s），外部系统偶发抖动时仍尽量送达。
 		const maxAttempts = 3
 		var lastErr error
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			if e.postCallback(url, body) {
+			if e.postCallback(url, body, headers) {
 				return
 			}
 			lastErr = fmt.Errorf("回调第 %d 次失败", attempt)
@@ -1170,8 +1201,99 @@ func (e *Engine) fireCallback(run *domain.TaskRun, report *domain.Report) {
 	}()
 }
 
+// callbackSigning 回调签名密钥解析结果。
+type callbackSigning struct {
+	keyID  string
+	secret string
+	hosts  []string
+}
+
+// callbackSigningSecret 根据任务发起密钥解析回调签名密钥；未启用或不可用时返回 ok=false。
+func (e *Engine) callbackSigningSecret(run *domain.TaskRun) (callbackSigning, bool) {
+	if run == nil || strings.TrimSpace(run.CallerAPIKeyID) == "" {
+		return callbackSigning{}, false
+	}
+	key, ok := e.st.GetAPIKey(run.CallerAPIKeyID)
+	if !ok || key == nil || !key.CallbackEnabled || key.CallbackSecretEnc == "" {
+		return callbackSigning{}, false
+	}
+	// 加密箱由 Authorizer 提供（env.Auth 实现了 Open）。
+	opener, ok := interface{}(e.auth).(interface {
+		Open(string) (string, error)
+	})
+	if !ok || e.auth == nil {
+		return callbackSigning{}, false
+	}
+	secret, err := opener.Open(key.CallbackSecretEnc)
+	if err != nil {
+		e.log.Warn("回调密钥解密失败，跳过签名", "run", run.ID, "err", err)
+		return callbackSigning{}, false
+	}
+	return callbackSigning{keyID: key.ID, secret: secret, hosts: key.CallbackHosts}, true
+}
+
+// callbackHostAllowed 校验回调目标：先挡内网/保留地址（SSRF），再按需匹配 host 白名单。
+func callbackHostAllowed(rawURL string, hosts []string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Host
+	if h, _, perr := net.SplitHostPort(host); perr == nil {
+		host = h
+	}
+	// host 白名单：非空时仅放行显式允许的 host（支持后缀通配 *.example.com）。
+	if len(hosts) > 0 {
+		matched := false
+		for _, allow := range hosts {
+			if hostAllowedPattern(host, strings.TrimSpace(allow)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	// SSRF 兜底：拒绝内网/保留地址段（即使白名单命中通配，内网地址仍需显式放行）。
+	if isPrivateHost(host) {
+		for _, allow := range hosts {
+			if strings.EqualFold(strings.TrimSpace(allow), host) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func hostAllowedPattern(host, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	if strings.EqualFold(host, pattern) {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := pattern[1:] // ".example.com"
+		return strings.HasSuffix(host, suffix) || strings.EqualFold(host, pattern[2:])
+	}
+	return false
+}
+
+// isPrivateHost 判断 host 是否为内网/保留地址（SSRF 防护）。
+func isPrivateHost(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// 非 IP（域名）：无法静态判定，交由白名单控制。
+		return false
+	}
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsPrivate()
+}
+
 // postCallback 向外部系统 POST 回调报文，返回是否送达（2xx）。
-func (e *Engine) postCallback(url string, body []byte) bool {
+func (e *Engine) postCallback(url string, body []byte, headers map[string]string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), callbackTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -1179,6 +1301,9 @@ func (e *Engine) postCallback(url string, body []byte) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		return false

@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"crypto/rand"
 	"errors"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -32,6 +34,12 @@ type createAPIKeyRequest struct {
 	Scopes []string `json:"scopes,omitempty"`
 	// TTLHours 有效期（小时），<=0 表示永不过期。
 	TTLHours int `json:"ttlHours,omitempty"`
+
+	// 回调鉴权（可选）。启用后，该密钥触发的任务终态回调将携带 HMAC-SHA256 签名。
+	// CallbackSecret 留空则服务端自动生成；也可由调用方自带（需自行保管，明文仅返回一次）。
+	CallbackEnabled bool     `json:"callbackEnabled,omitempty"`
+	CallbackSecret  string   `json:"callbackSecret,omitempty"`
+	CallbackHosts   []string `json:"callbackHosts,omitempty"`
 }
 
 // createCredentialRequest 创建 Git 凭证请求体（secret 明文仅入参，不落库、不回显）。
@@ -178,6 +186,11 @@ type apiKeyView struct {
 	LastUsedAt time.Time `json:"lastUsedAt,omitempty"`
 	Revoked    bool      `json:"revoked"`
 	CreatedAt  time.Time `json:"createdAt"`
+	// 回调鉴权状态（不返回密钥密文/明文）。
+	CallbackEnabled   bool     `json:"callbackEnabled"`
+	CallbackMode      string   `json:"callbackMode,omitempty"`
+	HasCallbackSecret bool     `json:"hasCallbackSecret"`
+	CallbackHosts     []string `json:"callbackHosts,omitempty"`
 }
 
 // maskAPIKey 把 APIKey 转换为脱敏视图（丢弃 KeyHash）。
@@ -190,6 +203,10 @@ func maskAPIKey(k domain.APIKey) apiKeyView {
 		ID: k.ID, TenantID: k.TenantID, Name: k.Name, KeyPrefix: k.KeyPrefix,
 		Scopes: scopes, ExpiresAt: k.ExpiresAt, LastUsedAt: k.LastUsedAt,
 		Revoked: k.Revoked, CreatedAt: k.CreatedAt,
+		CallbackEnabled:    k.CallbackEnabled,
+		CallbackMode:       k.CallbackMode,
+		HasCallbackSecret:  k.CallbackSecretEnc != "",
+		CallbackHosts:      k.CallbackHosts,
 	}
 }
 
@@ -245,13 +262,67 @@ func (d *Deps) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	// 回调鉴权（可选）：密钥与接入密钥/服务绑定，终态回调携带 HMAC 签名。
+	var callbackSecret string
+	if req.CallbackEnabled {
+		sealer, ok := d.Auth.(credentialSealer)
+		if !ok || d.Auth == nil || isNilInterface(d.Auth) {
+			end(d, r, reqID, "apikey.create", errors.New("auth 未实现 credentialSealer"))
+			writeError(w, r, errUnavailable("当前认证实现不支持回调密钥加密", nil))
+			return
+		}
+		callbackSecret = strings.TrimSpace(req.CallbackSecret)
+		if callbackSecret == "" {
+			gen := func() (string, error) {
+				const alpha = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+				buf := make([]byte, 40)
+				for i := range buf {
+					v, gerr := rand.Int(rand.Reader, big.NewInt(int64(len(alpha))))
+					if gerr != nil {
+						return "", gerr
+					}
+					buf[i] = alpha[v.Int64()]
+				}
+				return string(buf), nil
+			}
+			cs, gerr := gen()
+			if gerr != nil {
+				end(d, r, reqID, "apikey.create", gerr)
+				writeError(w, r, errUnavailable("生成回调密钥失败", gerr))
+				return
+			}
+			callbackSecret = cs
+		}
+		enc, serr := sealer.Seal(callbackSecret)
+		if serr != nil {
+			end(d, r, reqID, "apikey.create", serr)
+			writeError(w, r, errUnavailable("加密回调密钥失败", serr))
+			return
+		}
+		key.CallbackEnabled = true
+		key.CallbackSecretEnc = enc
+		key.CallbackMode = "hmac"
+		key.CallbackHosts = req.CallbackHosts
+		// GenerateAPIKey 已先行落库（无回调字段），此处覆盖写入完整密钥。
+		if err := d.Store.CreateAPIKey(key); err != nil {
+			end(d, r, reqID, "apikey.create", err)
+			writeError(w, r, errUnavailable("保存回调配置失败", err))
+			return
+		}
+	}
+
 	// 明文 key 只在此处返回一次；列表接口永不返回明文与哈希。
 	w.WriteHeader(http.StatusCreated)
-	httpx.WriteJSON(w, r, map[string]any{
+	resp := map[string]any{
 		"plainKey": plain,
 		"apiKey":   maskAPIKey(*key),
 		"notice":   "明文密钥仅此一次返回，请立即妥善保存；服务端只保存哈希。",
-	})
+	}
+	if req.CallbackEnabled {
+		resp["callbackSecret"] = callbackSecret
+		resp["callbackNotice"] = "回调签名密钥仅此一次返回，请配置到对端服务；服务端仅保存密文。"
+	}
+	httpx.WriteJSON(w, r, resp)
 	end(d, r, reqID, "apikey.create", nil)
 }
 

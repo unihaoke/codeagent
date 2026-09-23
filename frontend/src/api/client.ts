@@ -27,6 +27,8 @@ import type {
   Task,
   TaskRun,
   Tenant,
+  ApiKeyCreateBody,
+  ApiKeyCreateResult,
   AuditEvent,
   SkillCall,
   ModelCall,
@@ -184,8 +186,8 @@ export const api = {
   currentTenant: () => http.get<Tenant>('/tenants/current'),
   updateCurrentTenant: (body: Partial<Tenant>) => http.put<Tenant>('/tenants/current', body),
   listAPIKeys: async () => unwrapItems<APIKey>(await http.get<APIKey[] | ItemsPayload<APIKey>>('/api-keys')),
-  createAPIKey: (body: { name: string; scopes: string[]; ttlHours?: number }) =>
-    http.post<{ plainKey: string; apiKey: APIKey }>('/api-keys', body),
+  createAPIKey: (body: ApiKeyCreateBody) =>
+    http.post<ApiKeyCreateResult>('/api-keys', body),
   revokeAPIKey: (id: string) => http.del<{ revoked: boolean }>(`/api-keys/${id}`),
   listCredentials: async () =>
     unwrapItems<Credential>(await http.get<Credential[] | ItemsPayload<Credential>>('/credentials')),

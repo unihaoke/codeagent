@@ -78,6 +78,30 @@ export interface APIKey {
   lastUsedAt?: string
   revoked: boolean
   createdAt: string
+  // 回调鉴权状态（服务端脱敏，不带回密文）
+  callbackEnabled?: boolean
+  callbackMode?: string
+  hasCallbackSecret?: boolean
+  callbackHosts?: string[]
+}
+
+// 创建接入密钥请求体（含可选回调鉴权配置）。
+export interface ApiKeyCreateBody {
+  name: string
+  scopes: string[]
+  ttlHours?: number
+  callbackEnabled?: boolean
+  callbackSecret?: string
+  callbackHosts?: string[]
+}
+
+// 创建接入密钥返回（明文密钥与回调密钥均仅此一次返回）。
+export interface ApiKeyCreateResult {
+  plainKey: string
+  apiKey: APIKey
+  notice?: string
+  callbackSecret?: string
+  callbackNotice?: string
 }
 
 export interface Credential {

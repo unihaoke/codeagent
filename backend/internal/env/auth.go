@@ -73,6 +73,9 @@ type Auth struct {
 	secret []byte
 	ttl    time.Duration
 
+	// box 凭证加密箱：用于回调密钥的 Seal/Open（与 Git 凭证共用同一把加密密钥）。
+	box domain.CredentialBox
+
 	adminUser string
 	adminHash string
 }
@@ -103,7 +106,27 @@ func NewAuth(cfg *config.Config, st *store.Store) *Auth {
 	if a.adminUser == "" {
 		a.adminUser = "admin"
 	}
+	// 凭证加密箱：用于回调密钥的 Seal/Open。开发环境缺密钥时由 NewCredentialBox 兜底默认密钥。
+	if b, err := NewCredentialBox(cfg.Security); err == nil {
+		a.box = b
+	}
 	return a
+}
+
+// Seal 实现 credentialSealer：加密回调密钥明文（AES-GCM）。
+func (a *Auth) Seal(plain string) (string, error) {
+	if a == nil || a.box == nil {
+		return "", errors.New("凭证加密箱未初始化")
+	}
+	return a.box.Seal(plain)
+}
+
+// Open 解密回调密钥密文（供引擎终态回调节度使用）。
+func (a *Auth) Open(sealed string) (string, error) {
+	if a == nil || a.box == nil {
+		return "", errors.New("凭证加密箱未初始化")
+	}
+	return a.box.Open(sealed)
 }
 
 // Config 返回认证中心持有的配置（只读用途）。

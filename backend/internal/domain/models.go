@@ -50,6 +50,13 @@ type APIKey struct {
 	LastUsedAt time.Time `json:"lastUsedAt,omitempty"`
 	Revoked    bool      `json:"revoked"`
 	CreatedAt  time.Time `json:"createdAt"`
+
+	// 回调鉴权（方案2：密钥与接入密钥/服务绑定）。启用后，该密钥触发的任务终态回调
+	// 将以 HMAC-SHA256 签名置于请求头，供对端验签，证明回调确实来自本服务。
+	CallbackEnabled   bool     `json:"callbackEnabled,omitempty"` // 是否启用回调签名
+	CallbackSecretEnc string   `json:"callbackSecretEnc,omitempty"` // 回调密钥密文（AES-GCM，仅持久化；API 响应经 apiKeyView 脱敏不回显）
+	CallbackMode      string   `json:"callbackMode,omitempty"`    // "hmac"（当前唯一支持）
+	CallbackHosts     []string `json:"callbackHosts,omitempty"`   // 允许回调的 host 白名单（空=仅做 SSRF 防护）
 }
 
 // Credential Git 访问凭证。Secret 必须以密文形式持久化，日志与 API 一律脱敏。
@@ -178,6 +185,8 @@ type CreateTaskRequest struct {
 	AutoVerify *bool `json:"autoVerify,omitempty"`
 	// CallbackURL 异步回调地址（可选）。
 	CallbackURL string `json:"callbackUrl,omitempty"`
+	// CallerAPIKeyID 发起任务的接入密钥 ID，由接入层从主体注入，用于回调节度对应签名密钥。
+	CallerAPIKeyID string `json:"-"`
 	// TenantID 由接入层从凭证注入，调用方无需传递。
 	TenantID string `json:"-"`
 	// RequestID 链路追踪 ID，由接入层注入。
@@ -250,6 +259,8 @@ type TaskRun struct {
 	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 	RequestID      string `json:"requestId,omitempty"`
 	CallbackURL    string `json:"callbackUrl,omitempty"`
+	// CallerAPIKeyID 发起本次运行的接入密钥，回调节度据此选取签名密钥。
+	CallerAPIKeyID string `json:"callerApiKeyId,omitempty"`
 
 	Error     string    `json:"error,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
