@@ -28,10 +28,16 @@ COPY backend/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/codeagent-server ./cmd/server
 
 # ---------- 阶段 3：运行镜像 ----------
-FROM alpine:3.20
-RUN apk add --no-cache git ca-certificates tzdata curl && \
-    addgroup -S codeagent && adduser -S -G codeagent codeagent && \
-    mkdir -p /app/data && chown -R codeagent:codeagent /app
+# 注意：原 alpine:3.20 已于 2026-05 EOL，其仓库索引随时可能从 CDN 下线，
+# 会导致 `apk add` 报 exit code 4（比阶段 2 更快失败，因为两者走同一个 CDN）。
+# 固定仍在维护期的版本，且不写 latest，避免将来再次漂移。
+FROM alpine:3.22
+# 拆成多行：一旦某条失败可直接从构建日志定位是 apk 还是用户创建出错
+RUN apk add --no-cache git ca-certificates tzdata curl \
+    && addgroup -S codeagent \
+    && adduser -S -G codeagent codeagent \
+    && mkdir -p /app/data \
+    && chown -R codeagent:codeagent /app
 
 WORKDIR /app
 COPY --from=server /out/codeagent-server /app/codeagent-server
