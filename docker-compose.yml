@@ -7,6 +7,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Go 模块代理：宿主在 sealed/国内网络下访问 proxy.golang.org 会超时。
+        # 需要换源时：GOPROXY=https://mirrors.aliyun.com/goproxy/,direct docker compose build codeagent-server
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}
     image: codeagent:1.0.0
     container_name: codeagent-server
     restart: unless-stopped
