@@ -24,8 +24,7 @@ FROM golang:1.23-alpine AS server
 # `go mod download` 以 exit 1 失败；默认给出可用代理并保留官方源兜底。
 # 海外环境可用 --build-arg GOPROXY=https://proxy.golang.org,direct 覆盖。
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
-ENV GOPROXY=$GOPROXY \
-    GOFLAGS=-mod=mod
+ENV GOPROXY=$GOPROXY
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates
 COPY backend/go.mod backend/go.sum* ./
