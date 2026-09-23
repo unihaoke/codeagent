@@ -16,16 +16,36 @@ const STAGES = [
   { key: 'report', label: '报告归档' },
 ]
 
-const currentIndex = computed(() => STAGES.findIndex((s) => s.key === props.currentStage))
+// 运行态 → 当前阶段兜底：SSE 的 stage 事件缺失/中断时，依据权威状态推断高亮点。
+// queued 必须兜底到首个阶段，否则「已受理未开始」时进度条会整体不亮。
+const STAGE_BY_STATE: Record<string, string> = {
+  queued: 'resolve',
+  analyzing: 'stack_parse',
+  repairing: 'patch_synthesize',
+  verifying: 'sandbox_verify',
+}
+
+/** 流水线已走完的终态：整体点亮（failed/cancelled 可能中途中断，只亮到实际到达的阶段）。 */
+const FULL_LIT_STATES = ['succeeded', 'needs_review', 'degraded']
+
+const effectiveStage = computed(
+  () => props.currentStage || STAGE_BY_STATE[props.state ?? ''] || '',
+)
+const currentIndex = computed(() => STAGES.findIndex((s) => s.key === effectiveStage.value))
 const terminal = computed(() =>
   ['succeeded', 'needs_review', 'failed', 'cancelled', 'degraded'].includes(props.state ?? ''),
 )
 
 /** 计算某个阶段的展示状态。 */
 function statusOf(index: number): string {
-  if (currentIndex.value < 0) return terminal.value ? 'done' : ''
+  if (terminal.value) {
+    if (FULL_LIT_STATES.includes(props.state ?? '')) return 'done'
+    if (currentIndex.value < 0) return ''
+    return index <= currentIndex.value ? 'done' : ''
+  }
+  if (currentIndex.value < 0) return ''
   if (index < currentIndex.value) return 'done'
-  if (index === currentIndex.value) return terminal.value ? 'done' : 'active'
+  if (index === currentIndex.value) return 'active'
   return ''
 }
 </script>

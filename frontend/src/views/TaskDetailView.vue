@@ -10,7 +10,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ApiError, api, subscribeRunEvents } from '@/api/client'
-import type { AgentEvent, LineRange, ModelCall, Patch, SkillCall, TaskRun, VerificationCheck } from '@/types'
+import type { AgentEvent, LineRange, ModelCall, Patch, SkillCall, TaskRun, TaskState, VerificationCheck } from '@/types'
 import AppModal from '@/components/AppModal.vue'
 import CopyButton from '@/components/CopyButton.vue'
 import DiffView from '@/components/DiffView.vue'
@@ -317,6 +317,8 @@ const converged = ref(false)
 const autoScroll = ref(true)
 const timelineEl = ref<HTMLDivElement | null>(null)
 let unsubscribe: (() => void) | null = null
+/** 详情快照加载完成前到达的 task.state 目标状态：暂存后补，避免历史事件被丢弃。 */
+let pendingState: TaskState | null = null
 let terminalTimer: number | null = null
 let watchdogTimer: number | null = null
 let terminalReloaded = false
@@ -379,6 +381,16 @@ function startStream(): void {
       streamUnavailable.value = false
       streamNote.value = ''
       if (ev.type === 'stage' && ev.stage) currentStage.value = ev.stage
+      // 实时状态事件直接同步权威状态，避免中间态过渡时 UI 停留在旧快照
+      // （例如取消前显示排队中、实际后端已终态）。
+      // 详情快照尚未到达时（bootstrap 先订阅再 reload）暂存，加载完成后补应用。
+      if (ev.type === 'task.state') {
+        const to = asString(asRecord(ev.payload)?.to) as TaskState
+        if (to) {
+          if (run.value) run.value = { ...run.value, state: to }
+          else pendingState = to
+        }
+      }
       events.value.push(ev)
       if (events.value.length > MAX_EVENTS) events.value.splice(0, events.value.length - MAX_EVENTS)
       if (isTerminalEvent(ev)) void convergeTerminal()
@@ -390,6 +402,21 @@ function startStream(): void {
   )
   armWatchdog()
 }
+
+/**
+ * 应用暂存的实时状态。
+ *
+ * bootstrap 先建立 SSE 订阅再拉取详情，历史补发的 task.state 会早于详情到达；
+ * 若直接丢弃，页面会停留在旧快照（后端已 degraded、UI 仍显示 queued）。
+ */
+function applyPendingState(): void {
+  if (!pendingState || !run.value) return
+  if (run.value.state !== pendingState) run.value = { ...run.value, state: pendingState }
+  pendingState = null
+}
+
+// 详情加载完成（含终态收敛时的 reload）后立刻补应用暂存的实时状态。
+watch(run, () => applyPendingState())
 
 /** 终态收敛：重新拉取运行详情（只做一次），并在历史补发结束后关闭订阅。 */
 async function convergeTerminal(): Promise<void> {
@@ -531,9 +558,12 @@ async function bootstrap(): Promise<void> {
   skillPage.value = 1
   modelPage.value = 1
   callsError.value = ''
+  pendingState = null
   // 先订阅：SSE 建连时会自动补发历史事件（含终态任务），无需再单独拉历史
   startStream()
   await runAsync.reload()
+  // 补应用订阅期间先行到达的状态迁移，避免 UI 停留在旧快照。
+  applyPendingState()
   // 终态任务若历史事件未通过 SSE 补发，兜底点亮阶段进度条到末端阶段。
   if (isTerminal.value && !currentStage.value) currentStage.value = 'report'
   // 运行不存在 / 无权限时不再让 EventSource 反复重连
@@ -568,11 +598,13 @@ async function doCancel(): Promise<void> {
     } else {
       toastWarn('取消请求已发送，但任务可能已进入终态')
     }
-    await runAsync.reload()
   } catch (e) {
     toastError('取消失败', errMsg(e))
   } finally {
     acting.value = false
+    // 无论取消成功与否都重新拉取权威状态，避免 UI 停留在旧快照
+    // （例如后端已终态而前端仍显示排队中，导致重复点击取消报冲突）。
+    await runAsync.reload()
   }
 }
 

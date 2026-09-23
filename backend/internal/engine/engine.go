@@ -1099,18 +1099,19 @@ func (e *Engine) Workers() int {
 // 保证外部系统始终能读到稳定的键集合；rootCause/patches/reportUrl 为开放接口
 // 扩展字段，供第三方直接渲染（如飞书告警）而无需二次拉取。
 type callbackPayload struct {
-	RunID     string            `json:"runId"`
-	State     string            `json:"state"`
-	ReportID  string            `json:"reportId"`
-	Severity  string            `json:"severity"`
-	Summary   string            `json:"summary"`
-	TenantID  string            `json:"tenantId"`
-	TaskID    string            `json:"taskId"`
-	Attempt   int               `json:"attempt"`
-	Error     string            `json:"error,omitempty"`
-	RootCause *domain.RootCause `json:"rootCause,omitempty"`
-	Patches   []callbackPatch   `json:"patches,omitempty"`
-	ReportURL string            `json:"reportUrl,omitempty"`
+	RunID          string            `json:"runId"`
+	IdempotencyKey string            `json:"idempotencyKey,omitempty"`
+	State          string            `json:"state"`
+	ReportID       string            `json:"reportId"`
+	Severity       string            `json:"severity"`
+	Summary        string            `json:"summary"`
+	TenantID       string            `json:"tenantId"`
+	TaskID         string            `json:"taskId"`
+	Attempt        int               `json:"attempt"`
+	Error          string            `json:"error,omitempty"`
+	RootCause      *domain.RootCause `json:"rootCause,omitempty"`
+	Patches        []callbackPatch   `json:"patches,omitempty"`
+	ReportURL      string            `json:"reportUrl,omitempty"`
 }
 
 // callbackPatch 回调报文中的补丁摘要，供第三方直接展示差异。
@@ -1129,9 +1130,15 @@ func (e *Engine) fireCallback(run *domain.TaskRun, report *domain.Report) {
 		return
 	}
 	payload := callbackPayload{
-		RunID: run.ID, State: string(run.State), ReportID: run.ReportID,
-		Severity: string(run.Severity), TenantID: run.TenantID, TaskID: run.TaskID,
-		Attempt: run.Attempt, Error: run.Error,
+		RunID:          run.ID,
+		IdempotencyKey: run.IdempotencyKey,
+		State:          string(run.State),
+		ReportID:       run.ReportID,
+		Severity:       string(run.Severity),
+		TenantID:       run.TenantID,
+		TaskID:         run.TaskID,
+		Attempt:        run.Attempt,
+		Error:          run.Error,
 	}
 	if report != nil {
 		payload.Summary = report.Summary
