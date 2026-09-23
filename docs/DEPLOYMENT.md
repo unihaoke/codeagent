@@ -51,9 +51,12 @@ node scripts/build.mjs
 ### 3.2 Nginx + 后端分离形态（推荐）
 
 ```bash
-pnpm --dir frontend run build        # 产出 frontend/dist
 docker compose up -d --build         # 控制台 http://localhost:8090
 ```
+
+前端产物由 `Dockerfile` 的 `webconsole` target 在镜像内构建（`node` 阶段产出 dist → `nginx` 阶段直接 COPY），
+**不再需要在宿主机先跑 `pnpm build`**：宿主机 `frontend/dist` 不存在时 Docker 会挂载空目录，
+nginx 会以 `index.html not found` 返回 403 且日志不含明显线索——现在这个坑已经从架构上消除。
 
 `deploy/nginx.conf` 已处理三件容易踩坑的事：
 

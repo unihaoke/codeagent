@@ -257,7 +257,7 @@ curl -X POST $CODEAGENT/api/v1/tasks \
 | 形态 | 做法 |
 | --- | --- |
 | **本地轻量化**（IDE 本地修复） | `CA_ALLOW_ANONYMOUS=true`、`CA_STORE_DRIVER=memory`、`CA_SANDBOX_ALLOW_EXEC=false`，单二进制直接运行 |
-| **服务端私有化**（团队多项目接入） | `pnpm run build` 产出 `frontend/dist` 交给 Nginx 托管；后端 `go build -o codeagent-server ./cmd/server`；配置真实模型 provider 与 PostgreSQL 版 store 实现 |
+| **服务端私有化**（团队多项目接入） | `docker compose up -d --build`：前端 dist 在镜像内构建并交给 `webconsole` 阶段的 Nginx 托管；后端 `go build -o codeagent-server ./cmd/server`；配置真实模型 provider 与 PostgreSQL 版 store 实现 |
 | **流水线集成**（CI/CD 卡点） | CI 中以子进程或服务方式调用 `POST /api/v1/tasks`，传 `ref=$GIT_COMMIT` 与 `idempotencyKey`，用 `callbackUrl` 回传结果做卡点预警 |
 
 生产加固清单：

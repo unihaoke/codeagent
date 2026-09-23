@@ -40,7 +40,13 @@ services:
     networks: [codeagent]
 
   codeagent-web:
-    image: nginx:1.27-alpine
+    # 复用根 Dockerfile 的 webconsole target：前端 dist 与 nginx.conf 都在镜像内，
+    # 不再挂载宿主机目录，改配置/换前端版本统一走重新构建。
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: webconsole
+    image: codeagent-web:1.0.0
     container_name: codeagent-web
     restart: unless-stopped
     depends_on:
@@ -48,9 +54,6 @@ services:
         condition: service_healthy
     ports:
       - "${WEB_PORT:-8090}:80"
-    volumes:
-      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./frontend/dist:/usr/share/nginx/html:ro
     networks: [codeagent]
 
 volumes:

@@ -18,7 +18,18 @@ RUN pnpm install --frozen-lockfile=false
 COPY frontend/ ./
 RUN pnpm run build
 
-# ---------- 阶段 2：后端构建 ----------
+# ---------- 阶段 2：控制台镜像（Nginx 托管前端产物）----------
+# 复用阶段 1 的 web，前端只构建一次；dist 直接打进镜像，
+# 不再依赖宿主机 ./frontend/dist —— 该目录不存在时 Docker 会静默挂载空目录，
+# nginx 会以 "index.html not found" 返回 403，排查成本很高。
+FROM nginx:1.27-alpine AS webconsole
+COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=web /web/dist /usr/share/nginx/html
+EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -qO- http://127.0.0.1/ >/dev/null || exit 1
+
+# ---------- 阶段 3：后端构建 ----------
 FROM golang:1.23-alpine AS server
 # Go 模块代理：golang.org/x/crypto 等依赖走 proxy.golang.org，国内构建机常因超时导致
 # `go mod download` 以 exit 1 失败；默认给出可用代理并保留官方源兜底。
@@ -32,9 +43,10 @@ RUN go mod download
 COPY backend/ ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/codeagent-server ./cmd/server
 
-# ---------- 阶段 3：运行镜像 ----------
-# 注意：原 alpine:3.20 已于 2026-05 EOL，其仓库索引随时可能从 CDN 下线，
-# 会导致 `apk add` 报 exit code 4（比阶段 2 更快失败，因为两者走同一个 CDN）。
+# ---------- 阶段 4：运行镜像（默认 target）----------
+# 注意：原 alpine:3.20 已于 2026-05 EOL，其仓库索引随时可能从 CDN 下线导致 `apk add`
+# 报 exit code 4。与阶段 3（golang:1.23-alpine）走同一个 CDN，只要阶段 3 正常、本阶段
+# 失败，即可判定是基础镜像版本 EOL 而非网络问题。
 # 固定仍在维护期的版本，且不写 latest，避免将来再次漂移。
 FROM alpine:3.22
 # 拆成多行：一旦某条失败可直接从构建日志定位是 apk 还是用户创建出错
