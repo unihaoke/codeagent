@@ -165,6 +165,59 @@ func TestSubmitIdempotentReusesRun(t *testing.T) {
 	}
 }
 
+// TestSubmitEchoesCallerIdempotencyKey 守住跨系统对号契约。
+//
+// 调用方（如 nightjar）提交时带出去的 idempotencyKey 会作为它本地的任务主键，
+// 本服务必须原样落到运行上并在终态回调里回显，调用方才对得上号。
+// 曾经 Submit 把 req.IdempotencyKey 丢掉（传了空 submitOpts），退化成 sha256
+// 自生成的 32 位十六进制键，回调方只能报"任务不存在"。
+func TestSubmitEchoesCallerIdempotencyKey(t *testing.T) {
+	const callerKey = "mwo-1-abc"
+	got := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		select {
+		case got <- m:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config.Default()
+	cfg.Engine.Workers = 1
+	eng, st := newEngineForTest(t, cfg, &scriptedPipeline{state: domain.StateSucceeded}, domain.DefaultQuota())
+	defer func() { _ = eng.Stop() }()
+
+	req := submitReq("boom-idem-echo", callerKey)
+	req.CallbackURL = srv.URL
+	run, err := eng.Submit(context.Background(), submitSubject(), req)
+	if err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+	if run.IdempotencyKey != callerKey {
+		t.Fatalf("运行的幂等键必须是调用方传入的原值，实际 %q", run.IdempotencyKey)
+	}
+	if _, ok := st.FindRunByIdempotencyKey(testTenantID, callerKey); !ok {
+		t.Fatalf("幂等索引应按调用方键命中：%q", callerKey)
+	}
+
+	var payload map[string]any
+	select {
+	case payload = <-got:
+	case <-time.After(3 * time.Second):
+		t.Fatal("未收到终态回调")
+	}
+	if payload["idempotencyKey"] != callerKey {
+		t.Errorf("回调必须原样回显调用方幂等键，实际 %v", payload["idempotencyKey"])
+	}
+	if payload["runId"] != run.ID {
+		t.Errorf("回调 runId 错误: %v", payload["runId"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 配额
 // ---------------------------------------------------------------------------

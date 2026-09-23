@@ -554,7 +554,12 @@ func (e *Engine) Submit(ctx context.Context, sub *domain.Subject, req domain.Cre
 		req.CallerAPIKeyID = strings.TrimSpace(sub.APIKeyID)
 	}
 	req.TenantID = tenantID
-	return e.submit(ctx, tenantID, req, submitOpts{})
+	// 调用方显式给出的幂等键必须带进受理路径：它是跨系统对号的凭据，
+	// AI 服务会在终态回调里原样回显，调用方据此定位自己的任务记录。
+	// 若丢掉它退化成内容哈希（自生成的 32 位十六进制键），回调回来的号与调用方
+	// 本地主键不是同一个，对号必然失败（表现为"任务不存在"）。
+	// 未给出时才由 submit 内部按内容生成，保证同一条错误不被重复分析。
+	return e.submit(ctx, tenantID, req, submitOpts{key: strings.TrimSpace(req.IdempotencyKey)})
 }
 
 // submitOpts 内部受理参数（重跑等场景复用同一条受理路径）。
