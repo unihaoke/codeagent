@@ -1,0 +1,56 @@
+# =============================================================================
+# 生产部署示例：Nginx 托管前端静态资源 + 反向代理后端 API / SSE / WebSocket
+# 用法：docker compose up -d --build
+# =============================================================================
+services:
+  codeagent-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codeagent:1.0.0
+    container_name: codeagent-server
+    restart: unless-stopped
+    environment:
+      # 生产必须替换这两个密钥
+      CA_JWT_SECRET: "${CA_JWT_SECRET:-change-me-in-production}"
+      CA_ENCRYPTION_KEY: "${CA_ENCRYPTION_KEY:-change-me-in-production}"
+      CA_ALLOW_ANONYMOUS: "false"
+      CA_WORKERS: "4"
+      CA_LOG_FORMAT: "json"
+      CA_LOG_LEVEL: "info"
+      # 接入真实模型（示例：DeepSeek）。也可留空，启动后在控制台「AI 设置」页配置。
+      CA_MODEL_PROVIDER: "${CA_MODEL_PROVIDER:-}"
+      CA_MODEL_BASE_URL: "${CA_MODEL_BASE_URL:-}"
+      CA_MODEL_API_KEY: "${CA_MODEL_API_KEY:-}"
+      CA_MODEL_NAME: "${CA_MODEL_NAME:-}"
+    volumes:
+      - codeagent-data:/app/data
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks: [codeagent]
+
+  codeagent-web:
+    image: nginx:1.27-alpine
+    container_name: codeagent-web
+    restart: unless-stopped
+    depends_on:
+      codeagent-server:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8090}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    networks: [codeagent]
+
+volumes:
+  codeagent-data:
+
+networks:
+  codeagent:

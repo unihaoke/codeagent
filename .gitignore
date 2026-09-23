@@ -1,0 +1,19 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.exe
+*.test
+
+# 运行时数据（源码镜像、沙箱工作区、JSON 快照、日志、演示仓库）
+data/
+logs/
+*.log
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+# 前端本地环境覆盖
+.env.local
+.env.*.local

@@ -1,0 +1,119 @@
+{
+  "server": {
+    "addr": ":8080",
+    "readTimeoutSec": 30,
+    "writeTimeoutSec": 0,
+    "corsOrigins": ["*"],
+    "rateLimitPerMin": 600,
+    "maxBodyBytes": 4194304,
+    "enablePlayground": true
+  },
+  "auth": {
+    "jwtSecret": "codeagent-dev-secret-change-me",
+    "jwtTtlHours": 12,
+    "adminUsername": "admin",
+    "adminPasswordHash": "",
+    "allowAnonymous": false
+  },
+  "security": {
+    "encryptionKey": "codeagent-local-dev-encryption-key",
+    "maskEnabled": true,
+    "maskRules": []
+  },
+  "engine": {
+    "workers": 4,
+    "queueSize": 256,
+    "taskTimeoutSec": 900,
+    "stageTimeoutSec": 180,
+    "maxRetries": 2,
+    "idempotencyTtlSec": 3600,
+    "maxRepairRounds": 2,
+    "autoFix": true
+  },
+  "source": {
+    "cacheDir": "data/cache",
+    "workspaceDir": "data/workspace",
+    "cacheCapacity": 2000,
+    "cacheTtlSec": 1800,
+    "fetchDepth": 50,
+    "gitBinary": "git",
+    "cloneTimeoutSec": 180,
+    "respectGitignore": true,
+    "ignorePatterns": [
+      ".git",
+      "node_modules",
+      "dist",
+      "build",
+      "target",
+      "vendor",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      ".venv",
+      "coverage"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "allowCommandExec": true,
+    "commandTimeoutSec": 120,
+    "maxOutputBytes": 65536,
+    "networkIsolated": true,
+    "keepWorkspace": false,
+    "checks": {
+      "go": ["go vet ./...", "go build ./..."],
+      "java": ["./mvnw -q -o compile", "mvn -q -o compile"],
+      "typescript": ["npx --no-install tsc --noEmit"],
+      "javascript": ["node --check"],
+      "python": ["python -m compileall -q ."]
+    }
+  },
+  "mcp": {
+    "enabled": true,
+    "default": "",
+    "timeoutSec": 120,
+    "maxRetries": 2,
+    "providers": [],
+    "routing": {
+      "strongStages": ["root_cause", "patch_synthesize"],
+      "lightStages": ["log_clean", "classify", "summary"],
+      "costAware": true
+    },
+    "budget": {
+      "maxChars": 120000,
+      "maxSlices": 24,
+      "maxSliceChars": 12000,
+      "maxLogChars": 20000,
+      "reserveForOutput": 8000
+    },
+    "circuit": {
+      "failureThreshold": 3,
+      "cooldownSec": 30,
+      "halfOpenProbes": 1
+    },
+    "mock": {
+      "enabled": false,
+      "model": "mock-reasoner-v1",
+      "latencyMs": 5
+    }
+  },
+  "skill": {
+    "enabled": true,
+    "dir": "data/skills",
+    "failureThreshold": 3,
+    "cooldownSec": 30,
+    "defaultTimeoutSec": 60,
+    "defaultRetries": 1,
+    "overrides": []
+  },
+  "store": {
+    "driver": "file",
+    "dataFile": "data/state.json",
+    "snapshotIntervalSec": 2
+  },
+  "log": {
+    "level": "info",
+    "format": "text",
+    "file": ""
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mode": "group",
+  "groupId": "g-mall-core",
+  "ref": "",
+  "source": "alert",
+  "title": "订单详情接口 NPE：OrderService.toDetail 空指针",
+  "environment": "prod",
+  "autoVerify": true,
+  "stacktrace": "2024-06-11 10:23:41.883 ERROR [order-service,8f2c1d9a4b7e6f01,9c3d5e7a1b2f4d68] 1 --- [http-nio-8080-exec-3] c.a.o.web.OrderController : 订单详情查询失败\n\njava.lang.NullPointerException: Cannot invoke \"com.acme.order.entity.Order.getAmount()\" because \"order\" is null\n\tat com.acme.order.service.OrderService.toDetail(OrderService.java:88)\n\tat com.acme.order.service.OrderService.queryDetail(OrderService.java:64)\n\tat com.acme.order.web.OrderController.detail(OrderController.java:41)\n\tat org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1067)\nCaused by: com.acme.common.exception.RemoteCallException: inventory-service 调用失败\n\tat com.acme.order.client.InventoryClient.query(InventoryClient.java:52)\n\tat com.acme.order.service.OrderService.toDetail(OrderService.java:83)\n\t... 23 more\n",
+  "logs": "2024-06-11 10:23:41.750 INFO  [order-service] TraceId=8f2c1d9a4b7e6f01 GET /api/order/detail/9918273 start\n2024-06-11 10:23:41.812 WARN  [order-service] InventoryClient host=inventory-svc endpoint=/api/inventory/query timeout=2000ms\n2024-06-11 10:23:41.883 ERROR [order-service] api-gateway -> order-service -> inventory-service 链路异常\n",
+  "entryFiles": ["src/main/java/com/acme/order/service/OrderService.java"]
+}
