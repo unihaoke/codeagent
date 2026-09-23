@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "多仓库分组代码修复 AI Agent 控制台",
+  "packageManager": "pnpm@10.33.2",
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild", "vue-demi"]
+  },
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",

@@ -9,7 +9,11 @@
 FROM node:20-alpine AS web
 WORKDIR /web
 RUN corepack enable
+# packageManager 字段已锁定 pnpm 10.33.2：pnpm 11+ 不再读取 package.json 的 pnpm 字段，
+# 锁版本可避免 CI/镜像 silently 升级到 pnpm 12 后构建脚本策略再次漂移。
 COPY frontend/package.json frontend/pnpm-lock.yaml* ./
+# package.json 的 pnpm.onlyBuiltDependencies 已放行 esbuild / vue-demi 的构建脚本，
+# 用于满足 pnpm 10 起的构建脚本审批机制，替代无法在镜像构建中使用的交互式 pnpm approve-builds。
 RUN pnpm install --frozen-lockfile=false
 COPY frontend/ ./
 RUN pnpm run build
