@@ -152,6 +152,22 @@ export const http = {
   del: <T>(path: string) => request<T>('DELETE', path),
 }
 
+/**
+ * 解包后端 `{ items, total }` 形式的列表响应。
+ *
+ * 背景：服务端部分列表接口（/tenants、/api-keys、/credentials、/skills）在业务信封 data 里再包一层
+ * `{ items: [...], total: n }`，而不是直接返回数组。若前端按数组消费，`Array.isArray` 判定为 false，
+ * 页面会静默渲染空列表（且不报错），典型表现就是"创建成功但列表没数据"。
+ * 这里统一对齐到数组，避免每个页面各写一份判断。
+ */
+type ItemsPayload<T> = { items?: T[] | null; total?: number }
+
+function unwrapItems<T>(data: T[] | ItemsPayload<T> | null | undefined): T[] {
+  if (Array.isArray(data)) return data
+  const items = (data as ItemsPayload<T> | null | undefined)?.items
+  return Array.isArray(items) ? items : []
+}
+
 /* ------------------------------ 各资源 API ------------------------------ */
 
 export const api = {
@@ -163,15 +179,16 @@ export const api = {
   login: (tenantKey: string, username: string, password: string) =>
     http.post<{ token: string; subject: Subject }>('/auth/login', { tenantKey, username, password }),
   profile: () => http.get<Subject>('/auth/profile'),
-  listTenants: () => http.get<Tenant[]>('/tenants'),
+  listTenants: async () => unwrapItems<Tenant>(await http.get<Tenant[] | ItemsPayload<Tenant>>('/tenants')),
   createTenant: (body: Partial<Tenant>) => http.post<Tenant>('/tenants', body),
   currentTenant: () => http.get<Tenant>('/tenants/current'),
   updateCurrentTenant: (body: Partial<Tenant>) => http.put<Tenant>('/tenants/current', body),
-  listAPIKeys: () => http.get<APIKey[]>('/api-keys'),
+  listAPIKeys: async () => unwrapItems<APIKey>(await http.get<APIKey[] | ItemsPayload<APIKey>>('/api-keys')),
   createAPIKey: (body: { name: string; scopes: string[]; ttlHours?: number }) =>
     http.post<{ plainKey: string; apiKey: APIKey }>('/api-keys', body),
   revokeAPIKey: (id: string) => http.del<{ revoked: boolean }>(`/api-keys/${id}`),
-  listCredentials: () => http.get<Credential[]>('/credentials'),
+  listCredentials: async () =>
+    unwrapItems<Credential>(await http.get<Credential[] | ItemsPayload<Credential>>('/credentials')),
   createCredential: (body: { name: string; type: string; username?: string; secret: string }) =>
     http.post<Credential>('/credentials', body),
   deleteCredential: (id: string) => http.del<{ deleted: boolean }>(`/credentials/${id}`),
@@ -221,7 +238,8 @@ export const api = {
   reportMarkdownURL: (id: string) => `${API_BASE}/reports/${id}/markdown`,
 
   /* 技能 */
-  listSkills: (category?: string) => http.get<SkillView[]>('/skills', { category }),
+  listSkills: async (category?: string) =>
+    unwrapItems<SkillView>(await http.get<SkillView[] | ItemsPayload<SkillView>>('/skills', { category })),
   getSkill: (name: string) => http.get<SkillView>(`/skills/${name}`),
   setSkillStatus: (name: string, body: { version?: string; status: string; canaryPercent?: number }) =>
     http.post<{ updated: boolean }>(`/skills/${name}/status`, body),

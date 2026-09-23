@@ -4,7 +4,7 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useRealtimeStore } from '@/stores/realtime'
-import { toastOk } from '@/composables/useToast'
+import { toastError, toastOk } from '@/composables/useToast'
 
 const auth = useAuthStore()
 const realtime = useRealtimeStore()
@@ -20,7 +20,11 @@ const mode = ref<'jwt' | 'apikey'>('jwt')
 async function submit() {
   if (mode.value === 'apikey') {
     if (!apiKey.value.trim()) return
-    auth.useApiKey(apiKey.value.trim())
+    const ok = await auth.useApiKey(apiKey.value.trim())
+    if (!ok) {
+      toastError('API Key 校验失败', auth.error || '请确认密钥有效且未被吊销')
+      return
+    }
     realtime.connect()
     toastOk('已使用接入层 API Key 建立会话')
     await router.push((route.query.redirect as string) || { name: 'dashboard' })

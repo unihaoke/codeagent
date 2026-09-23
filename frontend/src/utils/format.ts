@@ -200,12 +200,45 @@ export function riskLabel(r?: string): string {
 }
 
 /** 复制到剪贴板。 */
+/**
+ * 复制文本到剪贴板。
+ *
+ * 注意：`navigator.clipboard` 仅在安全上下文（HTTPS 或 localhost）可用。
+ * 通过 http://<服务器 IP>:8090 访问控制台时它会 undefined 或直接抛错，
+ * 表现为"点了复制毫无反应"，因此必须保留 execCommand 兜底。
+ */
 export async function copyText(text: string): Promise<boolean> {
+  if (!text) return false
   try {
-    await navigator.clipboard.writeText(text)
-    return true
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    /* Clipboard API 被拒或非安全上下文：落到下面的兜底路径 */
+  }
+  return legacyCopy(text)
+}
+
+/** execCommand 兜底：非安全上下文（明文 http 访问）下唯一可用的复制手段。 */
+function legacyCopy(text: string): boolean {
+  let ta: HTMLTextAreaElement | null = null
+  try {
+    ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.top = '-1000px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    ta.setSelectionRange(0, text.length)
+    return document.execCommand('copy')
   } catch {
     return false
+  } finally {
+    if (ta?.parentNode) ta.parentNode.removeChild(ta)
   }
 }
 
